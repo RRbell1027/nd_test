@@ -1,5 +1,6 @@
 
 #include "nd.h"
+#include "nd_ioctl.h"
 
 #include <cerrno>
 #include <cstddef>
@@ -219,19 +220,68 @@ extern "C" int64_t nd_read(
     }
 
     /*
-     * TODO:
-     *
-     * Replace local read() with:
-     *
-     * 1. Translate logical file offsets to SD sectors.
-     * 2. Send ND_READ through USB.
-     * 3. Let Luckfox read the SD card.
-     * 4. Receive data through USB Bulk IN.
+     * 第一階段限制：
+     * - 只從邏輯位移 0 讀（使用第一個 extent）
+     * - 刻意不寫入 buffer
+     * - Luckfox 把讀到的資料印到 dmesg
      */
+    if (file->extents.empty()) {
+        errno = EIO;
+        return -1;
+    }
 
-    return static_cast<int64_t>(
-        ::read(file->fd, buffer, count)
-    );
+    const nd_extent &extent = file->extents[0];
+
+    constexpr uint64_t sector_size = 512;
+    constexpr uint64_t partition_start_sector = 4096;
+
+    /*
+     * FIEMAP 的 physical_offset 是相對於 /dev/vda2。
+     *
+     * 轉換：
+     *   vda2 實體位元組位移
+     *          ↓
+     *   vda2 sector
+     *          ↓
+     *   SD 卡絕對 sector
+     */
+    if (extent.physical_offset % sector_size != 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    const uint64_t sector =
+        extent.physical_offset / sector_size
+        + partition_start_sector;
+
+    if (count > UINT32_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    nd_read_request req {};
+    req.sector = sector;
+    req.length = static_cast<uint32_t>(count);
+
+    int nd_fd = ::open("/dev/nd0", O_RDWR | O_CLOEXEC);
+    if (nd_fd < 0) {
+        return -1;
+    }
+
+    if (::ioctl(nd_fd, ND_IOCTL_READ, &req) < 0) {
+        const int saved_errno = errno;
+        ::close(nd_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    ::close(nd_fd);
+
+    /*
+     * 第一階段不會把資料寫進 buffer。
+     * 成功只代表請求已送到 Luckfox。
+     */
+    return static_cast<int64_t>(count);
 }
 
 extern "C" int nd_close(nd_file *file)

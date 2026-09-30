@@ -22,8 +22,9 @@ typedef struct nd_extent {
 nd_file *nd_open(const char *path);
 
 /*
- * Initial implementation: reads from the Host filesystem.
- * Returns bytes read, 0 on EOF, or -1 on error.
+ * 第一階段：把第一個 extent 轉成 SD sector，經 /dev/nd0 ioctl 送到 Luckfox。
+ * 成功回傳 count，代表請求已送達；此時不會寫入 buffer。
+ * 失敗回傳 -1。
  */
 int64_t nd_read(nd_file *file, void *buffer, size_t count);
 

@@ -81,11 +81,9 @@ int main(int argc, char **argv)
     }
 
     std::printf(
-        "read %" PRId64 " bytes (HOST-LOCAL)\n",
+        "read %" PRId64 " bytes (ND_IOCTL_READ via /dev/nd0)\n",
         n
     );
-
-    std::printf("buffer: %.*s\n", (int)n, buffer);
 
     nd_close(file);
 
