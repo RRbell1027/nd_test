@@ -2,22 +2,27 @@ CXX ?= g++
 CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c++17
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
+BUILD := $(CURDIR)/build
 
-obj-m += nd_driver.o
+all: $(BUILD)/libnd.so $(BUILD)/test_nd $(BUILD)/nd_driver.ko
 
-all: libnd.so test_nd nd_driver.ko
+$(BUILD):
+	mkdir -p $(BUILD)
 
-libnd.so: libnd.cpp nd.h nd_ioctl.h
-	$(CXX) $(CXXFLAGS) -fPIC -shared -o $@ libnd.cpp
+$(BUILD)/libnd.so: libnd.cpp nd.h nd_ioctl.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC -shared \
+		-o $@ libnd.cpp
 
-test_nd: test_nd.cpp nd.h libnd.so
-	$(CXX) $(CXXFLAGS) -o $@ test_nd.cpp \
-		-L. -lnd -Wl,-rpath,'$$ORIGIN'
+$(BUILD)/test_nd: test_nd.cpp nd.h $(BUILD)/libnd.so | $(BUILD)
+	$(CXX) $(CXXFLAGS) \
+		-o $@ test_nd.cpp \
+		-L$(BUILD) -lnd \
+		-Wl,-rpath,'$$ORIGIN'
 
-nd_driver.ko: nd_driver.c nd_ioctl.h
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+$(BUILD)/nd_driver.ko: nd_driver.c nd_ioctl.h | $(BUILD)
+	cp nd_driver.c nd_ioctl.h $(BUILD)/
+	printf 'obj-m += nd_driver.o\n' > $(BUILD)/Makefile
+	$(MAKE) -C $(KDIR) M=$(BUILD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f libnd.so test_nd
+	rm -rf $(BUILD)
