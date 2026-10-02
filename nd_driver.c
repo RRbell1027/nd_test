@@ -6,6 +6,7 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/poll.h>
+#include <linux/mutex.h>
 
 #include "nd_driver.h"
 #include "nd_protocol.h"
@@ -20,6 +21,17 @@ struct nd_dev {
     struct usb_interface *interface;
 
     unsigned char bulk_out_ep;
+
+    /*
+     * /dev/nd0 is a byte-stream interface.
+     *
+     * QEMU may split one nd_driver_command into multiple writes,
+     * so bytes must be accumulated until a complete command is received.
+     */
+    u8 cmd_buf[sizeof(struct nd_driver_command)];
+    size_t cmd_received;
+
+    struct mutex cmd_lock;
 };
 
 /*
@@ -35,12 +47,8 @@ static struct nd_dev *nd;
 /* Character device operations                                                */
 /* -------------------------------------------------------------------------- */
 
-static ssize_t nd_write(struct file *file,
-    const char __user *buf,
-    size_t count,
-    loff_t *ppos)
+static int nd_handle_command(const struct nd_driver_command *cmd)
 {
-    struct nd_driver_command cmd;
     struct nd_command usb_cmd;
     int actual_length;
     int ret;
@@ -48,31 +56,29 @@ static ssize_t nd_write(struct file *file,
     if (!nd || !nd->udev)
         return -ENODEV;
 
-    if (count != sizeof(cmd))
+    if (cmd->magic != ND_DRIVER_MAGIC) {
+        pr_err("nd: invalid command magic: 0x%04x\n",
+               cmd->magic);
         return -EINVAL;
-
-    if (copy_from_user(&cmd, buf, sizeof(cmd)))
-        return -EFAULT;
-
-    if (cmd.magic != ND_DRIVER_MAGIC)
-        return -EINVAL;
+    }
 
     pr_info("nd: command received: command=%u sector=%llu length=%u\n",
-        cmd.command,
-        (unsigned long long)cmd.sector,
-        cmd.length
-    );
+            cmd->command,
+            (unsigned long long)cmd->sector,
+            cmd->length);
 
-    switch (cmd.command) {
-        case ND_DRIVER_CMD_READ:
-            usb_cmd.magic  = cpu_to_le16(ND_PROTOCOL_MAGIC);
-            usb_cmd.opcode = cpu_to_le16(ND_CMD_READ);
-            usb_cmd.length = cpu_to_le32(cmd.length);
-            usb_cmd.sector = cpu_to_le64(cmd.sector);
-            break;
+    switch (cmd->command) {
+    case ND_DRIVER_CMD_READ:
+        usb_cmd.magic  = cpu_to_le16(ND_PROTOCOL_MAGIC);
+        usb_cmd.opcode = cpu_to_le16(ND_CMD_READ);
+        usb_cmd.length = cpu_to_le32(cmd->length);
+        usb_cmd.sector = cpu_to_le64(cmd->sector);
+        break;
 
-        default:
-            return -EINVAL;
+    default:
+        pr_err("nd: unsupported command: %u\n",
+               cmd->command);
+        return -EINVAL;
     }
 
     ret = usb_bulk_msg(
@@ -91,15 +97,85 @@ static ssize_t nd_write(struct file *file,
 
     if (actual_length != sizeof(usb_cmd)) {
         pr_err("nd: short bulk OUT: %d/%zu\n",
-        actual_length, sizeof(usb_cmd));
+               actual_length,
+               sizeof(usb_cmd));
         return -EIO;
     }
 
     pr_info("nd: sent USB command: %d bytes\n",
-        actual_length
-    );
+            actual_length);
 
-    return count;
+    return 0;
+}
+
+
+static ssize_t nd_write(struct file *file,
+    const char __user *buf,
+    size_t count,
+    loff_t *ppos)
+{
+    size_t consumed = 0;
+    int ret = 0;
+
+    if (!nd || !nd->udev)
+        return -ENODEV;
+
+    mutex_lock(&nd->cmd_lock);
+
+    while (consumed < count) {
+        size_t remaining;
+        size_t chunk;
+
+        remaining =
+        sizeof(struct nd_driver_command) - nd->cmd_received;
+
+        chunk = min(count - consumed, remaining);
+
+        if (copy_from_user(
+                nd->cmd_buf + nd->cmd_received,
+                buf + consumed,
+                chunk)) {
+            ret = -EFAULT;
+            goto out;
+        }
+
+        nd->cmd_received += chunk;
+        consumed += chunk;
+
+        /*
+        * A complete command has been reconstructed from
+        * the byte stream.
+        */
+        if (nd->cmd_received ==
+                sizeof(struct nd_driver_command)) {
+
+            struct nd_driver_command cmd;
+
+            memcpy(&cmd,
+                nd->cmd_buf,
+                sizeof(cmd)
+            );
+
+            nd->cmd_received = 0;
+
+            ret = nd_handle_command(&cmd);
+
+            if (ret)
+                goto out;
+        }
+    }
+
+out:
+    mutex_unlock(&nd->cmd_lock);
+
+    /*
+    * If some bytes were successfully consumed, report them
+    * to the caller even if processing later failed.
+    */
+    if (consumed)
+        return consumed;
+
+    return ret;
 }
 
 static ssize_t nd_read(struct file *file,
