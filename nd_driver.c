@@ -6,7 +6,7 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 
-#include "nd_ioctl.h"
+#include "nd_driver.h"
 #include "nd_protocol.h"
 
 
@@ -34,67 +34,37 @@ static struct nd_dev *nd;
 /* Character device operations                                                */
 /* -------------------------------------------------------------------------- */
 
-static long nd_ioctl(struct file *file,
-                     unsigned int cmd,
-                     unsigned long arg)
+static ssize_t nd_write(struct file *file,
+    const char __user *buf,
+    size_t count,
+    loff_t *ppos)
 {
-    struct nd_read_request req;
-    struct nd_command usb_cmd;
+    struct nd_command cmd;
 
-    /*
-     * /dev/nd0 理論上只有 USB device 存在時才會出現，
-     * 但仍做一次防禦性檢查。
-     */
     if (!nd || !nd->udev)
         return -ENODEV;
 
-    switch (cmd) {
-    case ND_IOCTL_READ:
+    if (count != sizeof(cmd))
+        return -EINVAL;
 
-        if (copy_from_user(&req,
-                           (void __user *)arg,
-                           sizeof(req)))
-            return -EFAULT;
+    if (copy_from_user(&cmd, buf, sizeof(cmd)))
+        return -EFAULT;
 
-        pr_info("nd: READ sector=%llu length=%u\n",
-                (unsigned long long)req.sector,
-                req.length);
+    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC)
+        return -EINVAL;
 
-        /*
-         * Convert userspace request into ND wire protocol.
-         *
-         * 目前先保留原本行為。
-         * 下一步再把 usb_cmd 用 usb_bulk_msg()
-         * 送到 Luckfox f_nd。
-         */
-        usb_cmd.magic  = cpu_to_le16(ND_PROTOCOL_MAGIC);
-        usb_cmd.opcode = cpu_to_le16(ND_CMD_READ);
-        usb_cmd.length = cpu_to_le32(req.length);
-        usb_cmd.sector = cpu_to_le64(req.sector);
+    pr_info("nd: command received: opcode=%u sector=%llu length=%u\n",
+            le16_to_cpu(cmd.opcode),
+            le64_to_cpu(cmd.sector),
+            le32_to_cpu(cmd.length));
 
-        pr_info("nd: command prepared: opcode=%u sector=%llu length=%u\n",
-                ND_CMD_READ,
-                (unsigned long long)req.sector,
-                req.length);
+    /*
+    * TODO:
+    * 下一步再把 cmd 用 usb_bulk_msg()
+    * 送到 Luckfox f_nd。
+    */
 
-        /*
-         * TODO:
-         *
-         * usb_bulk_msg(
-         *     nd->udev,
-         *     usb_sndbulkpipe(nd->udev, nd->bulk_out_ep),
-         *     &usb_cmd,
-         *     sizeof(usb_cmd),
-         *     &actual_length,
-         *     timeout
-         * );
-         */
-
-        return 0;
-
-    default:
-        return -ENOTTY;
-    }
+    return sizeof(cmd);
 }
 
 
@@ -102,6 +72,7 @@ static const struct file_operations nd_fops = {
     .owner          = THIS_MODULE,
     .unlocked_ioctl = nd_ioctl,
 };
+
 
 
 /* -------------------------------------------------------------------------- */

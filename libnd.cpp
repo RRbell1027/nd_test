@@ -1,6 +1,6 @@
 
 #include "nd.h"
-#include "nd_ioctl.h"
+#include "nd_driver.h"
 
 #include <cerrno>
 #include <cstddef>
@@ -259,19 +259,28 @@ extern "C" int64_t nd_read(
         return -1;
     }
 
-    nd_read_request req {};
-    req.sector = sector;
-    req.length = static_cast<uint32_t>(count);
+    nd_command cmd {};
+    cmd.magic  = htole16(ND_PROTOCOL_MAGIC);
+    cmd.opcode = htole16(ND_CMD_READ);
+    cmd.length = htole32(static_cast<uint32_t>(count));
+    cmd.sector = htole64(sector);
 
     int nd_fd = ::open("/dev/nd0", O_RDWR | O_CLOEXEC);
     if (nd_fd < 0) {
         return -1;
     }
 
-    if (::ioctl(nd_fd, ND_IOCTL_READ, &req) < 0) {
+    ssize_t ret = ::write(nd_fd, &cmd, sizeof(cmd));
+    if (ret < 0) {
         const int saved_errno = errno;
         ::close(nd_fd);
         errno = saved_errno;
+        return -1;
+    }
+
+    if (ret != sizeof(cmd)) {
+        ::close(nd_fd);
+        errno = EIO;
         return -1;
     }
 
