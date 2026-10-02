@@ -1,0 +1,234 @@
+#!/bin/sh
+
+#
+# Luckfox RV1106 Custom USB Gadget
+# USB Mass Storage + Near-Data
+# Mass Storage backing device: SD card /dev/mmcblk1
+#
+
+CONFIGFS_DIR=/sys/kernel/config
+
+USB_GROUP=rockchip
+USB_ATTRIBUTE=0x409
+USB_SKELETON=b.1
+
+USB_CONFIGFS_DIR=${CONFIGFS_DIR}/usb_gadget/${USB_GROUP}
+USB_STRINGS_DIR=${USB_CONFIGFS_DIR}/strings/${USB_ATTRIBUTE}
+USB_FUNCTIONS_DIR=${USB_CONFIGFS_DIR}/functions
+USB_CONFIGS_DIR=${USB_CONFIGFS_DIR}/configs/${USB_SKELETON}
+USB_CONFIGS_STRINGS_DIR=${USB_CONFIGS_DIR}/strings/${USB_ATTRIBUTE}
+
+# Export the whole SD card
+UMS_BLOCK=/dev/mmcblk1
+UMS_RO=0
+
+
+usb_device_start()
+{
+    echo "Starting USB Mass Storage + Near-Data gadget..."
+
+    #
+    # 1. Make sure SD card exists
+    #
+    if [ ! -b "${UMS_BLOCK}" ]; then
+        echo "ERROR: SD card ${UMS_BLOCK} not found."
+        return 1
+    fi
+
+    #
+    # 2. Unmount SD card before exporting it through UMS
+    #
+    if grep -q "^${UMS_BLOCK}p" /proc/mounts; then
+        echo "SD card is mounted locally. Unmounting..."
+
+        umount ${UMS_BLOCK}p1
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to unmount ${UMS_BLOCK}p1."
+            return 1
+        fi
+
+        echo "SD card unmounted."
+    fi
+
+    #
+    # 3. Mount configfs if necessary
+    #
+    if ! grep -q " ${CONFIGFS_DIR} " /proc/mounts; then
+        mount -t configfs none ${CONFIGFS_DIR}
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to mount configfs."
+            return 1
+        fi
+    fi
+
+    #
+    # 4. Create USB gadget
+    #
+    mkdir -p ${USB_CONFIGFS_DIR}
+
+    echo 0x2207 > ${USB_CONFIGFS_DIR}/idVendor
+    echo 0x0000 > ${USB_CONFIGFS_DIR}/idProduct
+    echo 0x0310 > ${USB_CONFIGFS_DIR}/bcdDevice
+    echo 0x0200 > ${USB_CONFIGFS_DIR}/bcdUSB
+
+    #
+    # 5. USB strings
+    #
+    mkdir -p ${USB_STRINGS_DIR}
+
+    SERIAL=$(grep Serial /proc/cpuinfo | awk '{print $3}')
+    if [ -z "${SERIAL}" ]; then
+        SERIAL=0123456789ABCDEF
+    fi
+
+    echo "${SERIAL}" > ${USB_STRINGS_DIR}/serialnumber
+    echo "Luckfox" > ${USB_STRINGS_DIR}/manufacturer
+    echo "Luckfox Near-Data Storage" > ${USB_STRINGS_DIR}/product
+
+    #
+    # 6. Create USB configuration
+    #
+    mkdir -p ${USB_CONFIGS_DIR}
+    mkdir -p ${USB_CONFIGS_STRINGS_DIR}
+
+    echo "Mass Storage + Near-Data" > \
+        ${USB_CONFIGS_STRINGS_DIR}/configuration
+
+    echo 500 > ${USB_CONFIGS_DIR}/MaxPower
+
+    #
+    # 7. Create Mass Storage function
+    #
+    if [ ! -d "${USB_FUNCTIONS_DIR}/mass_storage.0" ]; then
+        mkdir ${USB_FUNCTIONS_DIR}/mass_storage.0
+    fi
+
+    echo ${UMS_RO} > \
+        ${USB_FUNCTIONS_DIR}/mass_storage.0/lun.0/ro
+
+    echo ${UMS_BLOCK} > \
+        ${USB_FUNCTIONS_DIR}/mass_storage.0/lun.0/file
+
+    #
+    # 8. Create Near-Data function
+    #
+    if [ ! -d "${USB_FUNCTIONS_DIR}/nd.0" ]; then
+        mkdir ${USB_FUNCTIONS_DIR}/nd.0
+
+        if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to create Near-Data function."
+            return 1
+        fi
+    fi
+
+    #
+    # 9. Add Mass Storage function to configuration
+    #
+    if [ ! -L "${USB_CONFIGS_DIR}/mass_storage.0" ]; then
+        ln -s \
+            ${USB_FUNCTIONS_DIR}/mass_storage.0 \
+            ${USB_CONFIGS_DIR}/mass_storage.0
+    fi
+
+    #
+    # 10. Add Near-Data function to configuration
+    #
+    if [ ! -L "${USB_CONFIGS_DIR}/nd.0" ]; then
+        ln -s \
+            ${USB_FUNCTIONS_DIR}/nd.0 \
+            ${USB_CONFIGS_DIR}/nd.0
+    fi
+
+    #
+    # 11. Find UDC
+    #
+    UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+
+    if [ -z "${UDC}" ]; then
+        echo "ERROR: No USB Device Controller found."
+        return 1
+    fi
+
+    #
+    # 12. Bind gadget to UDC
+    #
+    echo "${UDC}" > ${USB_CONFIGFS_DIR}/UDC
+
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to bind gadget to UDC ${UDC}."
+        return 1
+    fi
+
+    echo "USB Mass Storage + Near-Data started."
+    echo "UDC       : ${UDC}"
+    echo "SD device : ${UMS_BLOCK}"
+
+    return 0
+}
+
+
+usb_device_stop()
+{
+    echo "Stopping USB Mass Storage + Near-Data gadget..."
+
+    if [ ! -d "${USB_CONFIGFS_DIR}" ]; then
+        echo "USB gadget is not initialized."
+        return 0
+    fi
+
+    #
+    # 1. Unbind UDC
+    #
+    if [ -f "${USB_CONFIGFS_DIR}/UDC" ]; then
+        echo "" > ${USB_CONFIGFS_DIR}/UDC
+    fi
+
+    #
+    # 2. Remove functions from configuration
+    #
+    if [ -L "${USB_CONFIGS_DIR}/nd.0" ]; then
+        rm -f ${USB_CONFIGS_DIR}/nd.0
+    fi
+
+    if [ -L "${USB_CONFIGS_DIR}/mass_storage.0" ]; then
+        rm -f ${USB_CONFIGS_DIR}/mass_storage.0
+    fi
+
+    #
+    # 3. Detach backing block device
+    #
+    if [ -f "${USB_FUNCTIONS_DIR}/mass_storage.0/lun.0/file" ]; then
+        echo "" > \
+            ${USB_FUNCTIONS_DIR}/mass_storage.0/lun.0/file
+    fi
+
+    echo "USB Mass Storage + Near-Data stopped."
+
+    return 0
+}
+
+
+case "$1" in
+    start)
+        usb_device_start
+        ;;
+
+    stop)
+        usb_device_stop
+        ;;
+
+    restart|reload)
+        usb_device_stop
+        sleep 1
+        usb_device_start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit $?
