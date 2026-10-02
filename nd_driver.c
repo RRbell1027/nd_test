@@ -5,6 +5,7 @@
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
+#include <linux/poll.h>
 
 #include "nd_driver.h"
 #include "nd_protocol.h"
@@ -101,12 +102,33 @@ static ssize_t nd_write(struct file *file,
     return count;
 }
 
+static ssize_t nd_read(struct file *file,
+    char __user *buf,
+    size_t count,
+    loff_t *ppos)
+{
+    /*
+    * 暫時沒有任何 RX data。
+    * QEMU 用 O_NONBLOCK 開啟 /dev/nd0，
+    * 因此目前直接表示沒有資料可讀。
+    */
+    return -EAGAIN;
+}
+
+static __poll_t nd_poll(struct file *file, poll_table *wait)
+{
+    /*
+    * 暫時沒有 RX buffer，因此永遠沒有 POLLIN。
+    */
+    return 0;
+}
 
 static const struct file_operations nd_fops = {
     .owner          = THIS_MODULE,
     .write          = nd_write,
+    .read           = nd_read,
+    .poll           = nd_poll,
 };
-
 
 
 /* -------------------------------------------------------------------------- */
