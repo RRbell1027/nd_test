@@ -13,7 +13,7 @@ typedef uint32_t nd_u32;
 typedef uint64_t nd_u64;
 #endif
 
-#define ND_CMD_MAGIC 0x4E44
+#define ND_DRIVER_MAGIC 0x4E44
 
 enum nd_driver_command_type {
     ND_DRIVER_CMD_READ  = 1,
