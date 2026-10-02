@@ -25,7 +25,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 
-$(BUILD)/libnd.so: libnd.cpp nd.h nd_ioctl.h | $(BUILD)
+$(BUILD)/libnd.so: libnd.cpp nd.h nd_driver.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC -shared \
 		-o $@ libnd.cpp
 
@@ -37,8 +37,8 @@ $(BUILD)/test_nd: test_nd.cpp nd.h $(BUILD)/libnd.so | $(BUILD)
 		-Wl,-rpath,'$$ORIGIN'
 
 
-$(BUILD)/nd_driver.ko: nd_driver.c nd_ioctl.h nd_protocol.h | $(BUILD)
-	cp nd_driver.c nd_ioctl.h nd_protocol.h $(BUILD)/
+$(BUILD)/nd_driver.ko: nd_driver.c nd_driver.h nd_protocol.h | $(BUILD)
+	cp nd_driver.c nd_driver.h nd_protocol.h $(BUILD)/
 	printf 'obj-m += nd_driver.o\n' > $(BUILD)/Makefile
 	$(MAKE) -C $(KDIR) M=$(BUILD) modules
 
