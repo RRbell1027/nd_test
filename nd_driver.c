@@ -39,7 +39,7 @@ static ssize_t nd_write(struct file *file,
     size_t count,
     loff_t *ppos)
 {
-    struct nd_command cmd;
+    struct nd_driver_command cmd;
 
     if (!nd || !nd->udev)
         return -ENODEV;
@@ -50,13 +50,13 @@ static ssize_t nd_write(struct file *file,
     if (copy_from_user(&cmd, buf, sizeof(cmd)))
         return -EFAULT;
 
-    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC)
+    if (cmd.magic != ND_DRIVER_CMD_MAGIC)
         return -EINVAL;
 
-    pr_info("nd: command received: opcode=%u sector=%llu length=%u\n",
-            le16_to_cpu(cmd.opcode),
-            le64_to_cpu(cmd.sector),
-            le32_to_cpu(cmd.length));
+    pr_info("nd: command received: command=%u sector=%llu length=%u\n",
+            cmd.command,
+            (unsigned long long)cmd.sector,
+            cmd.length);
 
     /*
     * TODO:
@@ -70,7 +70,7 @@ static ssize_t nd_write(struct file *file,
 
 static const struct file_operations nd_fops = {
     .owner          = THIS_MODULE,
-    .unlocked_ioctl = nd_ioctl,
+    .write          = nd_write,
 };
 
 
