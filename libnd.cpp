@@ -260,7 +260,7 @@ extern "C" int64_t nd_read(
     }
 
     nd_driver_command  cmd {};
-    cmd.magic   = ND_CMD_MAGIC;
+    cmd.magic   = ND_DRIVER_MAGIC;
     cmd.command = ND_DRIVER_CMD_READ;
     cmd.length  = static_cast<uint32_t>(count);
     cmd.sector  = sector;
