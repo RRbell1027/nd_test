@@ -9,7 +9,7 @@ IS_WSL := $(shell grep -qi microsoft /proc/version 2>/dev/null && echo 1 || echo
 ifeq ($(IS_WSL),1)
     # WSL does not provide the usual /lib/modules/.../build tree.
     # Use the prepared Microsoft WSL kernel source/build tree.
-    KDIR ?= /sdk/linux-msft-wsl-5.15.167.4
+    KDIR ?= /sdk/WSL2-Linux-Kernel
 else
     # Normal Linux distribution
     KDIR ?= /lib/modules/$(shell uname -r)/build
