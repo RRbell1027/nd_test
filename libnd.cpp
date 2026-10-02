@@ -260,10 +260,10 @@ extern "C" int64_t nd_read(
     }
 
     nd_command cmd {};
-    cmd.magic  = htole16(ND_PROTOCOL_MAGIC);
-    cmd.opcode = htole16(ND_CMD_READ);
-    cmd.length = htole32(static_cast<uint32_t>(count));
-    cmd.sector = htole64(sector);
+    cmd.magic   = ND_CMD_MAGIC;
+    cmd.command = ND_CMD_READ;
+    cmd.length  = static_cast<uint32_t>(count);
+    cmd.sector  = sector;
 
     int nd_fd = ::open("/dev/nd0", O_RDWR | O_CLOEXEC);
     if (nd_fd < 0) {
