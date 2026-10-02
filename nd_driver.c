@@ -50,7 +50,7 @@ static ssize_t nd_write(struct file *file,
     if (copy_from_user(&cmd, buf, sizeof(cmd)))
         return -EFAULT;
 
-    if (cmd.magic != ND_DRIVER_CMD_MAGIC)
+    if (cmd.magic != ND_DRIVER_MAGIC)
         return -EINVAL;
 
     pr_info("nd: command received: command=%u sector=%llu length=%u\n",
