@@ -40,6 +40,9 @@ static ssize_t nd_write(struct file *file,
     loff_t *ppos)
 {
     struct nd_driver_command cmd;
+    struct nd_command usb_cmd;
+    int actual_length;
+    int ret;
 
     if (!nd || !nd->udev)
         return -ENODEV;
@@ -54,17 +57,48 @@ static ssize_t nd_write(struct file *file,
         return -EINVAL;
 
     pr_info("nd: command received: command=%u sector=%llu length=%u\n",
-            cmd.command,
-            (unsigned long long)cmd.sector,
-            cmd.length);
+        cmd.command,
+        (unsigned long long)cmd.sector,
+        cmd.length
+    );
 
-    /*
-    * TODO:
-    * 下一步再把 cmd 用 usb_bulk_msg()
-    * 送到 Luckfox f_nd。
-    */
+    switch (cmd.command) {
+        case ND_DRIVER_CMD_READ:
+            usb_cmd.magic  = cpu_to_le16(ND_PROTOCOL_MAGIC);
+            usb_cmd.opcode = cpu_to_le16(ND_CMD_READ);
+            usb_cmd.length = cpu_to_le32(cmd.length);
+            usb_cmd.sector = cpu_to_le64(cmd.sector);
+            break;
 
-    return sizeof(cmd);
+        default:
+            return -EINVAL;
+    }
+
+    ret = usb_bulk_msg(
+        nd->udev,
+        usb_sndbulkpipe(nd->udev, nd->bulk_out_ep),
+        &usb_cmd,
+        sizeof(usb_cmd),
+        &actual_length,
+        1000
+    );
+
+    if (ret) {
+        pr_err("nd: bulk OUT failed: %d\n", ret);
+        return ret;
+    }
+
+    if (actual_length != sizeof(usb_cmd)) {
+        pr_err("nd: short bulk OUT: %d/%zu\n",
+        actual_length, sizeof(usb_cmd));
+        return -EIO;
+    }
+
+    pr_info("nd: sent USB command: %d bytes\n",
+        actual_length
+    );
+
+    return count;
 }
 
 
