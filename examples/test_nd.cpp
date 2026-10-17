@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     }
 
     std::printf(
-        "read %" PRId64 " bytes (ND_IOCTL_READ via /dev/nd0)\n",
+        "requested %" PRId64 " bytes (write via /dev/nd0; buffer not filled)\n",
         n
     );
 

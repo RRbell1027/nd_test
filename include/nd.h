@@ -22,7 +22,7 @@ typedef struct nd_extent {
 nd_file *nd_open(const char *path);
 
 /*
- * 第一階段：把第一個 extent 轉成 SD sector，經 /dev/nd0 ioctl 送到 Luckfox。
+ * 第一階段：把第一個 extent 轉成 SD sector，經 write(/dev/nd0) 送到 Luckfox。
  * 成功回傳 count，代表請求已送達；此時不會寫入 buffer。
  * 失敗回傳 -1。
  */

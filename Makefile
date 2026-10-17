@@ -1,5 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c++17
+CPPFLAGS += -I$(CURDIR)/include
 
 BUILD := $(CURDIR)/build
 
@@ -16,29 +17,39 @@ else
 endif
 
 
-all: $(BUILD)/libnd.so \
-     $(BUILD)/test_nd \
-     $(BUILD)/nd_driver.ko
+.PHONY: all userspace driver clean print-config check sdk-check
+
+all: userspace driver
+
+userspace: $(BUILD)/libnd.so $(BUILD)/test_nd
+
+driver: $(BUILD)/nd_driver.ko
+
+check: userspace
+	python3 tests/host/smoke.py $(BUILD)
+
+sdk-check:
+	python3 tests/luckfox-sdk/validate.py
 
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 
-$(BUILD)/libnd.so: libnd.cpp nd.h nd_driver.h | $(BUILD)
-	$(CXX) $(CXXFLAGS) -fPIC -shared \
-		-o $@ libnd.cpp
+$(BUILD)/libnd.so: src/libnd.cpp include/nd.h include/nd_driver.h | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared \
+		-o $@ src/libnd.cpp
 
 
-$(BUILD)/test_nd: test_nd.cpp nd.h $(BUILD)/libnd.so | $(BUILD)
-	$(CXX) $(CXXFLAGS) \
-		-o $@ test_nd.cpp \
+$(BUILD)/test_nd: examples/test_nd.cpp include/nd.h $(BUILD)/libnd.so | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) \
+		-o $@ examples/test_nd.cpp \
 		-L$(BUILD) -lnd \
 		-Wl,-rpath,'$$ORIGIN'
 
 
-$(BUILD)/nd_driver.ko: nd_driver.c nd_driver.h nd_protocol.h | $(BUILD)
-	cp nd_driver.c nd_driver.h nd_protocol.h $(BUILD)/
+$(BUILD)/nd_driver.ko: drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h | $(BUILD)
+	cp drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h $(BUILD)/
 	printf 'obj-m += nd_driver.o\n' > $(BUILD)/Makefile
 	$(MAKE) -C $(KDIR) M=$(BUILD) modules
 

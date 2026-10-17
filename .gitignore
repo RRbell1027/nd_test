@@ -1,0 +1,7 @@
+/build/
+/artifacts/
+__pycache__/
+*.pyc
+
+# Platform files may contain installation-specific paths.
+/platform/*.local.ini
