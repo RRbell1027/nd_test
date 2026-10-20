@@ -1,7 +1,5 @@
 # Ubuntu Guest 驗證 — 2026-10-20
 
-本文保留當時的歷史測試。後續已將 overlay 合併回實體 SD，現行啟動改用 raw 可寫 SD，見 [直接 SD 模式](guest-direct-sd.md)。
-
 最終 compiler/application host 為 Ubuntu Guest；WSL 只提供 QEMU、USBIP 與 SDK 傳入。此次沒有用 Windows Clang 的結果替代 Guest 驗證。
 
 ## GitHub 與環境

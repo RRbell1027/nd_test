@@ -4,10 +4,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Process-wide, refcounted single-device session shared with the NDS plugin.
- * Repeated opens of the same path reuse the stream (no second HELLO).
- * All clients must link the same shared libnd_runtime. A second path fails
- * EBUSY while the session is active. Free allocations before final close.
+/* A session owns one exclusive RPC stream. Do not open a second session on
+ * the same device: HELLO resets device resources. Borrow an existing runtime
+ * session when integrating with another client (including OpenMP).
+ * Session close must not race operations; free device allocations first.
  */
 typedef nd_runtime nd_device;
 /* Opaque device address carried by a host pointer; never dereference on host.

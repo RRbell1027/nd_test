@@ -15,7 +15,7 @@ os.environ['ND_TRANSPORT_PATH'] = a.transport
 os.environ['ND_PARTITION_START_SECTOR'] = str(a.partition_start)
 lib = C.CDLL(a.lib, use_errno=True)
 lib.nd_open.argtypes = [C.c_char_p]; lib.nd_open.restype = C.c_void_p
-lib.nd_read_host_legacy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]; lib.nd_read_host_legacy.restype = C.c_int64
+lib.nd_read.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]; lib.nd_read.restype = C.c_int64
 lib.nd_close.argtypes = [C.c_void_p]; lib.nd_close.restype = C.c_int
 reference = Path(a.file).read_bytes()
 if len(reference) > 1024 * 1024:
@@ -23,10 +23,10 @@ if len(reference) > 1024 * 1024:
 handle = lib.nd_open(os.fsencode(a.file))
 if not handle: raise OSError(C.get_errno(), os.strerror(C.get_errno()))
 try:
-    assert lib.nd_read_host_legacy(handle, None, 0) == 0
+    assert lib.nd_read(handle, None, 0) == 0
     for requested in sorted({1, min(4096, len(reference)), len(reference) + 17}):
         buf = (C.c_ubyte * (requested + 16))(*([0xa5] * (requested + 16)))
-        result = lib.nd_read_host_legacy(handle, buf, requested)
+        result = lib.nd_read(handle, buf, requested)
         if result < 0: raise OSError(C.get_errno(), os.strerror(C.get_errno()))
         expected = min(requested, len(reference))
         assert result == expected, (result, expected)
