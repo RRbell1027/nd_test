@@ -37,9 +37,9 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 
-$(BUILD)/libnd.so: src/libnd.cpp include/nd.h include/nd_driver.h include/nd_protocol.h include/nd_rpc_wire.h | $(BUILD)
+$(BUILD)/libnd.so: runtime src/libnd.cpp include/nd.h include/nd_driver.h include/nd_protocol.h include/nd_rpc_wire.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared \
-		-o $@ src/libnd.cpp
+		-o $@ src/libnd.cpp -L$(BUILD)/runtime -lnd_runtime -pthread -Wl,-rpath,'$$ORIGIN/runtime'
 
 
 $(BUILD)/test_nd: examples/test_nd.cpp include/nd.h $(BUILD)/libnd.so | $(BUILD)
@@ -110,7 +110,7 @@ offload-runtime: llvm-guest runtime openmp-runtime
 		-DCMAKE_EXE_LINKER_FLAGS='-Wl,--gc-sections' \
 		-DLLVM_DIR=$(abspath $(LLVM_BUILD))/lib/cmake/llvm \
 		-DLIBOMPTARGET_PLUGINS_TO_BUILD=nds -DNDS_RUNTIME_INCLUDE_DIR=$(CURDIR)/include \
-		-DNDS_RUNTIME_LIBRARY=$(abspath $(BUILD))/runtime/libnd_runtime.a \
+		-DNDS_RUNTIME_LIBRARY=$(abspath $(BUILD))/runtime/libnd_runtime.so \
 		-DLIBOMP_STANDALONE=$(abspath $(OPENMP_BUILD))/runtime/src/libomp.so -DOFFLOAD_INCLUDE_TESTS=OFF
 	cmake --build $(OFFLOAD_BUILD) --target omptarget -j$(NDS_JOBS)
 
@@ -168,8 +168,27 @@ nds-usb-check: nds-check
 # Public host API, statically linked to the same runtime used by the plugin.
 .PHONY: device-api-check runtime-install
 $(BUILD)/device_memory: examples/device_memory.c include/nd_device.h runtime
-	$(CC) $(CPPFLAGS) -Wall -Wextra $< $(BUILD)/runtime/libnd_runtime.a -pthread -o $@
+	$(CC) $(CPPFLAGS) -Wall -Wextra $< -L$(BUILD)/runtime -lnd_runtime -pthread -Wl,-rpath,'$$ORIGIN/runtime' -o $@
 device-api-check: $(BUILD)/device_memory
 	$(BUILD)/device_memory $(ND_USB_TRANSPORT)
 runtime-install: runtime
 	cmake --install $(BUILD)/runtime $(if $(PREFIX),--prefix "$(PREFIX)",)
+
+# A file on the actual exported SD backing is required, not overlay-only data.
+NDS_INPUT_FILE ?= /usr/share/common-licenses/GPL-3
+.PHONY: nds-file-compile nds-file-check
+nds-file-compile: nds-runtime
+	$(NDS_CXX) -std=c++17 -Iinclude -fopenmp -fopenmp-targets=arm-nds-linux-gnueabihf \
+		-nds-platform=$(NDS_PLATFORM) -fno-addrsig \
+		-Xopenmp-target=arm-nds-linux-gnueabihf -mcpu=cortex-a7 \
+		examples/omp_file_read.cpp -o $(BUILD)/omp_file_read \
+		-L$(BUILD)/runtime -lnd -lnd_runtime \
+		-L$(abspath $(OPENMP_BUILD))/runtime/src -L$(abspath $(OFFLOAD_BUILD)) \
+		-Wl,-rpath,$(BUILD)/runtime -Wl,-rpath,$(abspath $(OPENMP_BUILD))/runtime/src \
+		-Wl,-rpath,$(abspath $(OFFLOAD_BUILD))
+nds-file-check: nds-file-compile
+	OMP_TARGET_OFFLOAD=MANDATORY ND_RUNTIME_DEVICE_PATH=$(ND_RUNTIME_DEVICE_PATH) $(BUILD)/omp_file_read $(NDS_INPUT_FILE)
+
+.PHONY: runtime-file-check
+runtime-file-check: runtime
+	python3 tests/runtime/file_device.py $(BUILD)/runtime

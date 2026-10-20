@@ -206,7 +206,7 @@ extern "C" nd_file *nd_open(const char *path)
     return file;
 }
 
-extern "C" int64_t nd_read(
+extern "C" int64_t nd_read_host_legacy(
     nd_file *file,
     void *buffer,
     size_t count)
@@ -337,6 +337,40 @@ extern "C" int64_t nd_read(
     }
     ::close(nd_fd);
     return static_cast<int64_t>(copied);
+}
+
+extern "C" int nd_device_read_storage(void *, uint64_t, size_t);
+extern "C" int64_t nd_read(nd_file *file, uint64_t offset, size_t count,
+                            nd_device_ptr destination)
+{
+    if (!file || (!destination && count) || count > INT64_MAX) {
+        errno = EINVAL; return -1;
+    }
+    if (!count || offset >= file->size) return 0;
+    count = std::min<uint64_t>(count, file->size - offset);
+    if (file->extents.empty()) { errno = ENOTSUP; return -1; }
+    const nd_extent &e = file->extents[0];
+    const uint32_t unsafe = FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC |
+        FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED |
+        FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE |
+        FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN;
+    if (offset < e.logical_offset || offset-e.logical_offset > e.length ||
+        count > e.length-(offset-e.logical_offset) || (e.flags & unsafe)) {
+        errno = ENOTSUP; return -1;
+    }
+    uint64_t start = 4096;
+    if (const char *v = std::getenv("ND_PARTITION_START_SECTOR")) {
+        char *end = nullptr; errno = 0;
+        start = std::strtoull(v, &end, 10);
+        if (errno || !*v || *v=='-' || !end || *end) { errno=EINVAL; return -1; }
+    }
+    if (start > UINT64_MAX/512 || e.physical_offset > UINT64_MAX-start*512 ||
+        offset-e.logical_offset > UINT64_MAX-start*512-e.physical_offset) {
+        errno=EOVERFLOW; return -1;
+    }
+    uint64_t physical = start*512+e.physical_offset+offset-e.logical_offset;
+    if (nd_device_read_storage(destination, physical, count)) return -1;
+    return static_cast<int64_t>(count);
 }
 
 extern "C" int nd_close(nd_file *file)

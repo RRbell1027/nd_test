@@ -102,3 +102,11 @@ int nd_rt_launch(nd_runtime *r,uint64_t function,const uint64_t *args,size_t cou
  return empty_rpc(r,NDR_LAUNCH,b,16+count*8);
 }
 int nd_rt_shutdown(nd_runtime *r){return empty_rpc(r,NDR_SHUTDOWN,NULL,0);}
+
+int nd_rt_read_storage(nd_runtime *r, uint64_t address, uint64_t offset, size_t bytes) {
+ if (bytes > NDR_MAX_BODY || offset > INT64_MAX || bytes > INT64_MAX - offset) {
+  errno = EINVAL; return -1;
+ }
+ unsigned char b[24]; ndr_put64(b,address); ndr_put64(b+8,offset); ndr_put64(b+16,bytes);
+ return empty_rpc(r,NDR_READ_STORAGE,b,sizeof b);
+}

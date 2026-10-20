@@ -62,7 +62,7 @@ Makefile 在 WSL 預設使用 `/sdk/WSL2-Linux-Kernel`，一般 Linux 則使用
 ./build/test_nd /path/to/file-on-exported-sd
 ```
 
-目前 `nd_read` 已經接收 Luckfox 的 USB response 並回填 buffer，會限制 EOF。
+目前 `nd_read(file, offset, bytes, device_ptr)` 直接將 SD 資料讀入 Luckfox allocation，搭配 OpenMP `is_device_ptr` 與 `nd_copy` 取回結果。舊 host-buffer 探針改名 `nd_read_host_legacy`，會限制 EOF。
 單次 wire transfer 最多 4 KiB，較大的單 extent 檔案會分多次請求；跨 extent
 尚未支援。預設 partition start 為本卡已核對的 4096 sectors，可用
 `ND_PARTITION_START_SECTOR` 覆寫。Guest 使用 `ND_TRANSPORT_PATH=/dev/ttyS0`。
@@ -111,3 +111,5 @@ inputs passed on Luckfox over USB. The runtime channel is Guest `/dev/ttyS0`
 through QEMU and WSL `/dev/nd0`, USB `f_nd`, and board `/dev/nd_rpc`.
 Use `make nds-usb-check`; UART remains available for board management. See
 [docs/nds-runtime.md](docs/nds-runtime.md) for setup and supported types.
+
+Guest SD 直接運算範例：`make nds-file-check NDS_JOBS=6`，見 [examples/omp_file_read.cpp](examples/omp_file_read.cpp)。公開 libnd 與 OpenMP plugin 共用 `libnd_runtime.so` session；輸入須是實際 SD 上的檔案，不能只存在 QEMU overlay。

@@ -4,19 +4,16 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* A session owns one exclusive RPC stream. Do not open a second session on
- * the same device: HELLO resets device resources. Borrow an existing runtime
- * session when integrating with another client (including OpenMP).
- * Session close must not race operations; free device allocations first.
+/* Process-wide, refcounted single-device session shared with the NDS plugin.
+ * Repeated opens of the same path reuse the stream (no second HELLO).
+ * All clients must link the same shared libnd_runtime. A second path fails
+ * EBUSY while the session is active. Free allocations before final close.
  */
 typedef nd_runtime nd_device;
 /* Opaque device address carried by a host pointer; never dereference on host.
  * This public API requires a 64-bit host. Use uintptr_t arithmetic for byte
  * offsets within an allocation; nd_free requires its base address.
  */
-#if UINTPTR_MAX != UINT64_MAX
-#error "The ND device pointer API requires a 64-bit host"
-#endif
 typedef void *nd_device_ptr;
 typedef enum nd_copy_kind {
  ND_HOST_TO_DEVICE = 1,

@@ -13,7 +13,7 @@
 #define NDR_MAX_ARGS 16
 #define NDR_SLOTS 64
 enum ndr_op { NDR_HELLO=ND_RPC_HELLO, NDR_LOAD, NDR_UNLOAD, NDR_ALLOC, NDR_FREE,
-              NDR_PUT, NDR_GET, NDR_SYMBOL, NDR_LAUNCH, NDR_SHUTDOWN };
+              NDR_PUT, NDR_GET, NDR_SYMBOL, NDR_LAUNCH, NDR_SHUTDOWN, NDR_READ_STORAGE };
 static inline uint32_t ndr_get32(const void *v) {
  const unsigned char *p=v;return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
 }

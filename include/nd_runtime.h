@@ -10,6 +10,14 @@ typedef struct nd_runtime nd_runtime;
 nd_runtime *nd_rt_connect_fd(int fd);
 nd_runtime *nd_rt_open(const char *path);
 void nd_rt_close(nd_runtime *rt);
+/* Process-wide single-device session. All users must link the same shared
+ * runtime. NULL path selects ND_RUNTIME_DEVICE_PATH (default /dev/ttyS0).
+ * A different path while active fails EBUSY; acquire/release are refcounted.
+ */
+nd_runtime *nd_rt_acquire(const char *path);
+void nd_rt_release(nd_runtime *rt);
+/* Direct storage byte range into a registered device allocation. */
+int nd_rt_read_storage(nd_runtime *, uint64_t address, uint64_t offset, size_t bytes);
 const char *nd_rt_error(nd_runtime *rt);
 int nd_rt_device_bits(nd_runtime *rt);
 /* ELF contents, never a host/device pathname. */

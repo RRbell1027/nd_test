@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 #include "wire.h"
 #include <dlfcn.h>
 #include <elf.h>
@@ -140,6 +141,24 @@ static int operation(uint32_t op,unsigned char *b,size_t n,unsigned char **answe
   _Static_assert(sizeof function == sizeof symbols[i].address, "POSIX function pointer representation" );
   memcpy(&function,&symbols[i].address,sizeof function);
   ffi_call(&cif,function,NULL,arguments);return 0;
+ }
+ case NDR_READ_STORAGE: {
+  if(n!=24)return EINVAL;
+  uint64_t address=ndr_get64(b),offset=ndr_get64(b+8),bytes=ndr_get64(b+16);
+  if(bytes>NDR_MAX_BODY||!range(address,bytes))return EFAULT;
+  if(offset>INT64_MAX||bytes>INT64_MAX-offset)return EOVERFLOW;
+  const char *path=getenv("ND_STORAGE_PATH");
+  int fd=open(path?path:"/dev/mmcblk1",O_RDONLY|O_CLOEXEC);
+  if(fd<0)return errno;
+  size_t done=0;int status=0;
+  while(done<bytes) {
+   ssize_t got=pread(fd,(unsigned char*)(uintptr_t)address+done,
+                     (size_t)bytes-done,(off_t)(offset+done));
+   if(got<0&&errno==EINTR)continue;
+   if(got<=0){status=got<0?errno:EIO;break;}
+   done+=(size_t)got;
+  }
+  close(fd);return status;
  }
  case NDR_SHUTDOWN: return n?EINVAL:0;
  default:return ENOTSUP;
