@@ -198,3 +198,8 @@ runtime-file-check: runtime
 ND_GUEST_DISK ?= /dev/sdd
 guest-direct-start:
 	python3 tests/guest/start_direct.py --disk $(ND_GUEST_DISK) --transport $(ND_USB_TRANSPORT)
+
+.PHONY: sdk-install
+SDK_PREFIX ?= /usr/local
+sdk-install: nds-runtime
+	bash sdk/install.sh --prefix $(SDK_PREFIX)
