@@ -101,3 +101,13 @@ UMS 啟動腳本的使用範圍與原型限制。
 ## NDS runtime bring-up
 
 新版 NDS runtime 直接上傳 ELF image bytes，再由 Luckfox executor 載入執行，不依賴板端預存 kernel 路徑。client/executor 已通過 UART 實機測試；USB adapter 與完整 OpenMP integration 尚未完成。建置與範圍見 [NDS runtime](docs/nds-runtime.md)。
+
+### Guest OpenMP runtime on Luckfox
+
+`make nds-runtime` builds the native Guest LLVM/OpenMP/NDS runtime;
+`make runtime-arm` cross-builds the Luckfox executor. With the runtime channel
+connected, `make nds-check` compiles and executes mandatory ARM32 offload tests
+for mapped scalars and int32/float/double vector element buffers. Both test
+inputs passed on Luckfox. The current runtime channel uses UART via a QEMU
+virtio port; USB runtime RPC is not yet implemented. See
+[docs/nds-runtime.md](docs/nds-runtime.md) for setup and supported types.

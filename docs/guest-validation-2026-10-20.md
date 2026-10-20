@@ -55,3 +55,13 @@
 - `OMP_TARGET_OFFLOAD=DISABLED` 的 host fallback 執行 PASS，exit 0。這不是 Luckfox offload 執行。
 - Guest 證據：`artifacts/guest-link/manifest.json`、`link.log`、`host-fallback.log` 與保留的 ARM image；本機保存 manifest 與 log 摘錄。
 - 此結果只涵蓋最小 mapped int 的編譯／連結，不代表 scalar/vector 等跨位寬參數 ABI 或實機 kernel launch 已驗證。
+
+## 真正 Luckfox runtime 執行通過
+
+- `make nds-compile` 在隔離 host/device C++ headers 後 PASS，exit 0。
+- 實機首輪 mandatory 執行 FAIL，exit 134；共用 ELF 檢查只支援 ELF64。加入 ELF32 image/symbol 支援後 PASS，exit 0。
+- Guest→virtio→WSL byte bridge→Luckfox UART，kernel image 實際上傳並在 ARM32 executor 執行。
+- 最終 `make nds-check NDS_JOBS=6` PASS，exit 0。delta=7、19 均確認 mapped scalar、int32/float/double vector 元素與 reference 一致，且 kernel 回傳指標寬度32；設定 MANDATORY，沒有 fallback。
+- `make runtime-arm` 亦 PASS，exit 0，產出 ARM32/uClibc executor。
+- 新 Makefile 入口包含 llvm-guest、openmp-runtime、offload-runtime、nds-runtime、nds-compile、nds-check、runtime-arm、runtime-uart-start、runtime-uart-bridge、runtime-guest-port。
+- USB runtime adapter 尚未實作；此結果不能當作 USB ND transport 通過。完整啟動與型別限制見 docs/nds-runtime.md。

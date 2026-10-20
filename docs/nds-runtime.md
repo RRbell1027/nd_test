@@ -16,16 +16,17 @@ Luckfox nd-executor → temporary ELF → dlopen/dlsym → libffi launch
                  allocate / submit / retrieve / free / unload
 ```
 
-## 本輪已驗證與尚未完成
+## 已驗證與範圍
 
-- Runtime client/executor 已在本機 Unix socket 與 Luckfox ARM32 UART 實測。
-- 板端只部署通用 executor；兩份同名函式、內容不同的 ARM ELF（各 5276 bytes）都由 client 當次傳送。以 input=20 分別得到 27、39，驗證並非使用板上固定 kernel。
-- 路徑 payload 被拒絕；missing symbol、越界 retrieve、unload 後舊 handle 均回錯誤；正常 alloc/submit/launch/retrieve/free/unload 通過。
-- NDS plugin 已以目前 LLVM headers 編譯成 Linux x86_64 ELF object；尚未完成整個 Linux libomptarget library 連結及 OpenMP 程式載入 plugin 的驗證。此證據不能視為 LEO-25 完成。
-- 實機 transport 目前是 UART binary RPC。現有 USB ND function 只有 SD READ；USB image/RPC adapter 尚未實作，不能把 UART 測試稱為 USB offload 成功。
-- 目前只接受 native little-endian ET_DYN ELF、單裝置、同步執行、單 thread/team、最多 16 個 mapped-pointer arguments。Scalar/aggregate/firstprivate ABI、parallel kernel、完整 OpenMP outlined image 仍待接通；已針對 NDS ARM32 開放 frontend 檢查，但這不代表參數 ABI 或完整 offload 通過。
-- Wire 使用固定 little-endian 欄位與 uint64 address/handle slots；裝置依自己的 uintptr_t/libffi pointer ABI 轉換。主機不傳原生指標 struct，也不以參數 storage 地址差猜大小。
-- 任一連線最多 64 image/region/symbol slots；單 frame/總 allocation 限 16 MiB。這是個人原型，不提供程式執行隔離；kernel 以 executor 權限執行。
+- Guest Ubuntu 原生 Clang/OpenMP/NDS plugin → 傳送 ARM ELF bytes → Luckfox executor → mapped buffer/kernel launch → 結果回傳，已實機通過。
+- `make nds-check NDS_JOBS=6` exit 0：`OMP_TARGET_OFFLOAD=MANDATORY` 下，delta=7、19 均通過；kernel 回傳 `sizeof(void*)*8 == 32`，不允許 host fallback。
+- `examples/omp_runtime_smoke.cpp` 驗證 mapped int32 scalar，以及 vector<int32_t>、vector<float>、vector<double> 的 data() 連續元素。逐項與 host reference 比較；不傳 std::vector 物件。
+- `make runtime-arm` 在 Guest 交叉建置 ARM32/uClibc executor，exit 0。Native `make runtime-check` 與先前兩份不同 ARM image 的 RPC 測試也通過。
+- 修正 OpenMP 隱含 launch-environment sentinel、runtime ELF32 檢查/symbol lookup，以及 NDS device 誤用 host C++/glibc headers 的問題。最初失敗的 mandatory 測試 exit 134 已被後續成功結果取代；原 log 保留。
+- 實機 transport 是 Guest virtio serial → WSL byte bridge → Luckfox UART。USB ND interface 目前只有 SD READ；USB runtime adapter 尚未完成，不能稱為 USB offload 成功。
+- 初版只涵蓋 ARM32 little-endian ET_DYN、單裝置、同步單 thread/team、最多 16 個呼叫參數（包含隱含 launch 參數）。Scalar 必須明確 mapping；一般 firstprivate/value ABI、含指標 aggregate、nested vector、parallel kernel 尚未支援。
+- Wire 使用固定 little-endian 欄位與 uint64 address/handle slots；executor 轉成原生 uintptr_t/libffi pointer ABI。主機不直接截短 host pointer。
+- 連線最多 64 image/region/symbol slots，單 frame/總 allocation 限 16 MiB；UART 大型 payload 效能尚未驗證。Kernel 以 executor 權限執行。
 
 ## 建置與本機測試
 
@@ -101,3 +102,30 @@ Windows 開發環境可用 `tests/runtime/compile_plugin.py` 搭配既有 LLVM b
 - 第一版目標為固定寬度整數、float、double，以及以 data()/元素數量映射的 vector 連續元素；不是直接映射 std::vector 物件。
 - 跨裝置資料避免 long、unsigned long、size_t、ptrdiff_t、long double；含指標 struct、巢狀 vector 與深層 mapping 暫不支援。這些是使用規範，不新增 frontend 型別拒絕。
 - frontend 針對 NDS vendor 的已知架構開放 target 與不同指標寬度；未知架構及非 NDS target 保留原有檢查。開放檢查不代表參數 ABI 或完整 offload 已驗證。
+
+## Guest 與 Luckfox 執行入口
+
+Guest SDK/ARM libffi 路徑見 Makefile 的 `NDS_DEVICE_CC`、`NDS_DEVICE_FFI_ROOT`，可覆寫。`platform/guest.local.ini` 指向 Guest SDK；FFI 必須使用 ARM 版，不能使用 x86_64 headers/library。
+
+```sh
+# Guest：建置 host runtime、NDS plugin，以及板端 executor
+make nds-runtime NDS_JOBS=6
+make runtime-arm
+# 通道已由管理端啟動，且 dev 可存取此 virtio port 時：
+make nds-check NDS_JOBS=6
+```
+
+管理端（目前為 WSL）準備好可用的 ARM executor 檔案後，以下各步使用同一個 `NDS_BRIDGE_SOCKET`：
+
+```sh
+make runtime-uart-start NDS_UART=/dev/ttyUSB0 NDS_EXECUTOR=/path/to/arm/nd-executor
+# 此命令佔用前景執行；另開管理 terminal 執行下一步。
+make runtime-uart-bridge NDS_UART=/dev/ttyUSB0
+make runtime-guest-port NDS_QMP=/tmp/near-data-qmp.sock
+```
+
+Guest port 為 `/dev/virtio-ports/nds-runtime`；首次需由管理端賦予 dev 存取權。UART 只能有一個使用者，不可同時開 shell terminal 與 bridge。只上傳通用 executor；kernel image 每次由編譯後的執行檔交給 plugin 傳送。
+
+目前保留 executor/bridge/Guest port 運行，可直接重跑 Guest `make nds-check`。停止時應先用 runtime SHUTDOWN RPC 結束 executor，待 tty 還原後停止 bridge；重新開機或重設 UART 後需重新建立通道。
+
+本輪證據保存在 Guest `artifacts/guest-link/make-nds-check.log`、`.exit` 及 `runtime-board2.log`；本機亦保存對應 log。
