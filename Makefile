@@ -78,3 +78,55 @@ runtime-check: runtime
 	sed 's/+ 7/+ 19/' examples/runtime_kernel.c > $(BUILD)/runtime/kernel-b.c
 	$(CC) -shared -fPIC $(BUILD)/runtime/kernel-b.c -o $(BUILD)/runtime/kernel-b.so
 	python3 tests/runtime/image_roundtrip.py --lib $(BUILD)/runtime/libnd_runtime.so --executor $(BUILD)/runtime/nd-executor $(BUILD)/runtime/kernel-a.so $(BUILD)/runtime/kernel-b.so
+
+# Native Linux Guest LLVM/OpenMP/NDS bring-up.
+LLVM_BUILD ?= $(BUILD)/llvm
+OPENMP_BUILD ?= $(BUILD)/openmp
+OFFLOAD_BUILD ?= $(BUILD)/offload-native
+NDS_JOBS ?= 3
+NDS_PLATFORM ?= platform/guest.local.ini
+NDS_CLANG := $(abspath $(LLVM_BUILD))/bin/clang
+NDS_CXX := $(abspath $(LLVM_BUILD))/bin/clang++
+ND_RUNTIME_DEVICE_PATH ?= /dev/virtio-ports/nds-runtime
+
+.PHONY: llvm-guest openmp-runtime offload-runtime nds-runtime nds-compile nds-check runtime-uart-bridge
+llvm-guest:
+	cmake -G Ninja -S llvm-project/llvm -B $(LLVM_BUILD) -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_C_FLAGS_RELEASE='-O0 -DNDEBUG' -DCMAKE_CXX_FLAGS_RELEASE='-O0 -DNDEBUG' \
+		-DCMAKE_EXE_LINKER_FLAGS='-Wl,--gc-sections' -DLLVM_ENABLE_PROJECTS=clang \
+		-DLLVM_TARGETS_TO_BUILD='X86;ARM' -DLLVM_PARALLEL_LINK_JOBS=1 \
+		-DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+		-DLLVM_INCLUDE_BENCHMARKS=OFF -DCLANG_INCLUDE_TESTS=OFF
+	cmake --build $(LLVM_BUILD) --target clang clang-offload-packager clang-linker-wrapper -j$(NDS_JOBS)
+	test -e $(NDS_CXX) || ln -s clang $(NDS_CXX)
+
+openmp-runtime:
+	cmake -G Ninja -S llvm-project/openmp -B $(OPENMP_BUILD) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(OPENMP_BUILD) -j$(NDS_JOBS)
+
+offload-runtime: llvm-guest runtime openmp-runtime
+	cmake -G Ninja -S llvm-project/offload -B $(OFFLOAD_BUILD) -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_C_COMPILER=$(NDS_CLANG) -DCMAKE_CXX_COMPILER=$(NDS_CXX) \
+		-DCMAKE_EXE_LINKER_FLAGS='-Wl,--gc-sections' \
+		-DLLVM_DIR=$(abspath $(LLVM_BUILD))/lib/cmake/llvm \
+		-DLIBOMPTARGET_PLUGINS_TO_BUILD=nds -DNDS_RUNTIME_INCLUDE_DIR=$(CURDIR)/include \
+		-DNDS_RUNTIME_LIBRARY=$(abspath $(BUILD))/runtime/libnd_runtime.a \
+		-DLIBOMP_STANDALONE=$(abspath $(OPENMP_BUILD))/runtime/src/libomp.so -DOFFLOAD_INCLUDE_TESTS=OFF
+	cmake --build $(OFFLOAD_BUILD) --target omptarget -j$(NDS_JOBS)
+
+nds-runtime: offload-runtime
+
+nds-compile: nds-runtime
+	$(NDS_CXX) -std=c++17 -fopenmp -fopenmp-targets=arm-nds-linux-gnueabihf \
+		-nds-platform=$(NDS_PLATFORM) -fno-addrsig \
+		-Xopenmp-target=arm-nds-linux-gnueabihf -mcpu=cortex-a7 \
+		examples/omp_runtime_smoke.cpp -o $(BUILD)/omp_runtime_smoke \
+		-L$(abspath $(OPENMP_BUILD))/runtime/src -L$(abspath $(OFFLOAD_BUILD)) \
+		-Wl,-rpath,$(abspath $(OPENMP_BUILD))/runtime/src -Wl,-rpath,$(abspath $(OFFLOAD_BUILD))
+
+nds-check: nds-compile
+	OMP_TARGET_OFFLOAD=MANDATORY ND_RUNTIME_DEVICE_PATH=$(ND_RUNTIME_DEVICE_PATH) $(BUILD)/omp_runtime_smoke 7
+	OMP_TARGET_OFFLOAD=MANDATORY ND_RUNTIME_DEVICE_PATH=$(ND_RUNTIME_DEVICE_PATH) $(BUILD)/omp_runtime_smoke 19
+
+runtime-uart-bridge:
+	python3 runtime/uart_bridge.py --uart $(or $(NDS_UART),/dev/ttyUSB0) --socket $(NDS_BRIDGE_SOCKET)
