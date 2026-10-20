@@ -65,7 +65,7 @@ int main(int argc, char **argv)
     char buffer[256];
 
     const int64_t n =
-        nd_read(file, buffer, sizeof(buffer));
+        nd_read_host_legacy(file, buffer, sizeof(buffer));
 
     if (n < 0) {
 
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
     }
 
     std::printf(
-        "requested %" PRId64 " bytes (write via /dev/nd0; buffer not filled)\n",
+        "read %" PRId64 " bytes from Luckfox into buffer\n",
         n
     );
 

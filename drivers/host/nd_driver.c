@@ -1,486 +1,350 @@
+// SPDX-License-Identifier: GPL-2.0
+/* One ND device, one transaction at a time. QEMU sees an unframed byte stream;
+ * this driver reconstructs legacy READ commands or complete runtime RPC frames.
+ */
 #include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/mm.h>
 #include <linux/poll.h>
 #include <linux/mutex.h>
-
+#include <linux/wait.h>
+#include <asm/unaligned.h>
 #include "nd_driver.h"
 #include "nd_protocol.h"
 
-
-/* -------------------------------------------------------------------------- */
-/* ND USB device                                                              */
-/* -------------------------------------------------------------------------- */
-
+#define ND_USB_PACKET (sizeof(struct nd_command) + ND_MAX_READ)
 struct nd_dev {
     struct usb_device *udev;
-    struct usb_interface *interface;
-
-    unsigned char bulk_out_ep;
-
-    /*
-     * /dev/nd0 is a byte-stream interface.
-     *
-     * QEMU may split one nd_driver_command into multiple writes,
-     * so bytes must be accumulated until a complete command is received.
-     */
-    u8 cmd_buf[sizeof(struct nd_driver_command)];
-    size_t cmd_received;
-
-    struct mutex cmd_lock;
+    u8 out_ep, in_ep;
+    u8 tx[ND_USB_PACKET] __aligned(8);
+    u8 rx[ND_USB_PACKET] __aligned(8);
+    u8 header[ND_RPC_HEADER_SIZE];
+    size_t header_used, header_need;
+    u8 *frame, *response;
+    size_t frame_used, frame_size;
+    size_t response_size, response_offset, response_capacity;
 };
-
-/*
- * 第一版先只支援一個 ND device。
- *
- * 未來若需要同時支援多個 Luckfox，
- * 就不能再使用這個 global pointer。
- */
 static struct nd_dev *nd;
+static DEFINE_MUTEX(nd_lock);
+static DECLARE_WAIT_QUEUE_HEAD(nd_read_wait);
 
-
-/* -------------------------------------------------------------------------- */
-/* Character device operations                                                */
-/* -------------------------------------------------------------------------- */
-
-static int nd_handle_command(const struct nd_driver_command *cmd)
+static void nd_clear_request(struct nd_dev *d)
 {
-    struct nd_command usb_cmd;
-    int actual_length;
-    int ret;
-
-    if (!nd || !nd->udev)
-        return -ENODEV;
-
-    if (cmd->magic != ND_DRIVER_MAGIC) {
-        pr_err("nd: invalid command magic: 0x%04x\n",
-               cmd->magic);
-        return -EINVAL;
-    }
-
-    pr_info("nd: command received: command=%u sector=%llu length=%u\n",
-            cmd->command,
-            (unsigned long long)cmd->sector,
-            cmd->length);
-
-    switch (cmd->command) {
-    case ND_DRIVER_CMD_READ:
-        usb_cmd.magic  = cpu_to_le16(ND_PROTOCOL_MAGIC);
-        usb_cmd.opcode = cpu_to_le16(ND_CMD_READ);
-        usb_cmd.length = cpu_to_le32(cmd->length);
-        usb_cmd.sector = cpu_to_le64(cmd->sector);
-        break;
-
-    default:
-        pr_err("nd: unsupported command: %u\n",
-               cmd->command);
-        return -EINVAL;
-    }
-
-    ret = usb_bulk_msg(
-        nd->udev,
-        usb_sndbulkpipe(nd->udev, nd->bulk_out_ep),
-        &usb_cmd,
-        sizeof(usb_cmd),
-        &actual_length,
-        1000
-    );
-
-    if (ret) {
-        pr_err("nd: bulk OUT failed: %d\n", ret);
-        return ret;
-    }
-
-    if (actual_length != sizeof(usb_cmd)) {
-        pr_err("nd: short bulk OUT: %d/%zu\n",
-               actual_length,
-               sizeof(usb_cmd));
-        return -EIO;
-    }
-
-    pr_info("nd: sent USB command: %d bytes\n",
-            actual_length);
-
-    return 0;
+    kvfree(d->frame);
+    d->frame = NULL;
+    d->frame_used = d->frame_size = d->header_used = 0;
+    d->header_need = 4;
 }
 
-
-static ssize_t nd_write(struct file *file,
-    const char __user *buf,
-    size_t count,
-    loff_t *ppos)
-{
-    size_t consumed = 0;
-    int ret = 0;
-
-    if (!nd || !nd->udev)
-        return -ENODEV;
-
-    mutex_lock(&nd->cmd_lock);
-
-    while (consumed < count) {
-        size_t remaining;
-        size_t chunk;
-
-        remaining =
-        sizeof(struct nd_driver_command) - nd->cmd_received;
-
-        chunk = min(count - consumed, remaining);
-
-        if (copy_from_user(
-                nd->cmd_buf + nd->cmd_received,
-                buf + consumed,
-                chunk)) {
-            ret = -EFAULT;
-            goto out;
-        }
-
-        nd->cmd_received += chunk;
-        consumed += chunk;
-
-        /*
-        * A complete command has been reconstructed from
-        * the byte stream.
-        */
-        if (nd->cmd_received ==
-                sizeof(struct nd_driver_command)) {
-
-            struct nd_driver_command cmd;
-
-            memcpy(&cmd,
-                nd->cmd_buf,
-                sizeof(cmd)
-            );
-
-            nd->cmd_received = 0;
-
-            ret = nd_handle_command(&cmd);
-
-            if (ret)
-                goto out;
-        }
-    }
-
-out:
-    mutex_unlock(&nd->cmd_lock);
-
-    /*
-    * If some bytes were successfully consumed, report them
-    * to the caller even if processing later failed.
-    */
-    if (consumed)
-        return consumed;
-
-    return ret;
-}
-
-static ssize_t nd_read(struct file *file,
-    char __user *buf,
-    size_t count,
-    loff_t *ppos)
-{
-    /*
-    * 暫時沒有任何 RX data。
-    * QEMU 用 O_NONBLOCK 開啟 /dev/nd0，
-    * 因此目前直接表示沒有資料可讀。
-    */
-    return -EAGAIN;
-}
-
-static __poll_t nd_poll(struct file *file, poll_table *wait)
-{
-    /*
-    * 暫時沒有 RX buffer，因此永遠沒有 POLLIN。
-    */
-    return 0;
-}
-
-static const struct file_operations nd_fops = {
-    .owner          = THIS_MODULE,
-    .write          = nd_write,
-    .read           = nd_read,
-    .poll           = nd_poll,
-};
-
-
-/* -------------------------------------------------------------------------- */
-/* /dev/nd0                                                                   */
-/* -------------------------------------------------------------------------- */
-
-static struct miscdevice nd_device = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "nd0",
-    .fops  = &nd_fops,
-};
-
-
-/* -------------------------------------------------------------------------- */
-/* USB probe                                                                  */
-/* -------------------------------------------------------------------------- */
-
-static int nd_probe(struct usb_interface *interface,
-                    const struct usb_device_id *id)
-{
-    struct usb_host_interface *iface_desc;
-    struct usb_endpoint_descriptor *endpoint;
-    struct nd_dev *dev;
-
-    int i;
-    int ret;
-
-    pr_info("nd: f_nd interface detected\n");
-
-    dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-    if (!dev)
-        return -ENOMEM;
-
-    /*
-     * Keep a reference to the underlying USB device.
-     */
-    dev->udev = usb_get_dev(interface_to_usbdev(interface));
-    dev->interface = interface;
-
-    iface_desc = interface->cur_altsetting;
-
-    pr_info("nd: interface number=%u endpoints=%u\n",
-            iface_desc->desc.bInterfaceNumber,
-            iface_desc->desc.bNumEndpoints);
-
-    /*
-     * Search for f_nd Bulk OUT endpoint.
-     *
-     * 目前 f_nd descriptor:
-     *
-     *     bNumEndpoints = 1
-     *     endpoint       = Bulk OUT
-     */
-    for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
-
-        endpoint = &iface_desc->endpoint[i].desc;
-
-        pr_info("nd: endpoint[%d] address=0x%02x attributes=0x%02x\n",
-                i,
-                endpoint->bEndpointAddress,
-                endpoint->bmAttributes);
-
-        if (usb_endpoint_is_bulk_out(endpoint)) {
-
-            dev->bulk_out_ep =
-                endpoint->bEndpointAddress;
-
-            pr_info("nd: found Bulk OUT endpoint 0x%02x\n",
-                    dev->bulk_out_ep);
-        }
-    }
-
-    /*
-     * f_nd 沒有 Bulk OUT 就不是我們預期的 interface。
-     */
-    if (!dev->bulk_out_ep) {
-
-        pr_err("nd: Bulk OUT endpoint not found\n");
-
-        ret = -ENODEV;
-        goto error;
-    }
-
-    /*
-     * 第一版只允許一個 ND device。
-     */
-    if (nd) {
-
-        pr_err("nd: another ND device is already connected\n");
-
-        ret = -EBUSY;
-        goto error;
-    }
-
-    /*
-     * Associate this USB interface with our nd_dev.
-     *
-     * disconnect() 可以再用 usb_get_intfdata()
-     * 找回這個 pointer。
-     */
-    usb_set_intfdata(interface, dev);
-
-    /*
-     * 現在才建立 /dev/nd0。
-     *
-     * 也就是：
-     *
-     *     f_nd exists
-     *         ↓
-     *     probe()
-     *         ↓
-     *     misc_register()
-     *         ↓
-     *     /dev/nd0
-     */
-    ret = misc_register(&nd_device);
-
-    if (ret) {
-
-        pr_err("nd: failed to register /dev/nd0: %d\n",
-               ret);
-
-        usb_set_intfdata(interface, NULL);
-
-        goto error;
-    }
-
-    nd = dev;
-
-    pr_info("nd: registered /dev/nd0\n");
-
-    return 0;
-
-
-error:
-
-    usb_put_dev(dev->udev);
-    kfree(dev);
-
-    return ret;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* USB disconnect                                                             */
-/* -------------------------------------------------------------------------- */
-
-static void nd_disconnect(struct usb_interface *interface)
-{
-    struct nd_dev *dev;
-
-    dev = usb_get_intfdata(interface);
-
-    usb_set_intfdata(interface, NULL);
-
-    /*
-     * USB interface 消失時，
-     * /dev/nd0 也一起移除。
-     */
-    if (nd == dev) {
-
-        misc_deregister(&nd_device);
-
-        nd = NULL;
-
-        pr_info("nd: removed /dev/nd0\n");
-    }
-
-    if (dev) {
-
-        usb_put_dev(dev->udev);
-
-        kfree(dev);
-    }
-
-    pr_info("nd: f_nd interface disconnected\n");
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* USB device matching                                                        */
-/* -------------------------------------------------------------------------- */
-
-/*
- * 目前 Luckfox f_nd descriptor:
- *
- *     bInterfaceClass    = USB_CLASS_VENDOR_SPEC (0xff)
- *     bInterfaceSubClass = 0
- *     bInterfaceProtocol = 0
- *
- * 因此第一版直接用 interface descriptor match。
- *
- * 注意：
- * 如果未來 composite gadget 裡還有其他
- * class=0xff/subclass=0/protocol=0 的 interface，
- * 這個 match 就太寬了。
- *
- * 之後建議把 f_nd 改成 ND 專屬 subclass/protocol。
+/* OUT RPC packets have a fixed transfer size, so even exact 512-byte payload
+ * boundaries complete the gadget's receive request without depending on a ZLP.
  */
-static const struct usb_device_id nd_usb_ids[] = {
+static int nd_exchange(struct nd_dev *d, u16 op, u64 sector,
+                       const void *data, u32 length)
+{
+    struct nd_command *cmd = (struct nd_command *)d->tx;
+    struct nd_response *r = (struct nd_response *)d->rx;
+    u32 payload;
+    s32 status;
+    int ret, actual, out_size;
 
-    {
-        USB_INTERFACE_INFO(
-            USB_CLASS_VENDOR_SPEC,
-            0,
-            0
-        )
-    },
+    memset(d->tx, 0, sizeof(d->tx));
+    cmd->magic = cpu_to_le16(ND_PROTOCOL_MAGIC);
+    cmd->opcode = cpu_to_le16(op);
+    cmd->length = cpu_to_le32(length);
+    cmd->sector = cpu_to_le64(sector);
+    out_size = sizeof(*cmd);
+    if (op == ND_CMD_RPC_OUT) {
+        memcpy(d->tx + sizeof(*cmd), data, length);
+        out_size = sizeof(d->tx);
+    }
+    ret = usb_bulk_msg(d->udev, usb_sndbulkpipe(d->udev, d->out_ep),
+                       d->tx, out_size, &actual, 5000);
+    if (ret)
+        return ret;
+    if (actual != out_size)
+        return -EIO;
+    ret = usb_bulk_msg(d->udev, usb_rcvbulkpipe(d->udev, d->in_ep),
+                       d->rx, sizeof(d->rx), &actual, 30000);
+    if (ret)
+        return ret;
+    if (actual < sizeof(*r))
+        return -EPROTO;
+    payload = le32_to_cpu(r->length);
+    status = (s32)le32_to_cpu(r->status);
+    if (le16_to_cpu(r->magic) != ND_PROTOCOL_MAGIC ||
+        le16_to_cpu(r->version) != ND_RESPONSE_VERSION || r->reserved ||
+        payload > ND_MAX_READ || actual != sizeof(*r) + payload ||
+        status > 0 || status < -4095 || (status && payload))
+        return -EPROTO;
+    if (status)
+        return status;
+    if ((op == ND_CMD_RPC_OUT || op == ND_CMD_RPC_RESET) && payload)
+        return -EPROTO;
+    if ((op == ND_CMD_READ || op == ND_CMD_RPC_IN) && payload > length)
+        return -EPROTO;
+    return payload;
+}
 
+static int nd_response_space(struct nd_dev *d, size_t size)
+{
+    u8 *p;
+    if (size <= d->response_capacity)
+        return 0;
+    p = kvmalloc(size, GFP_KERNEL);
+    if (!p)
+        return -ENOMEM;
+    kvfree(d->response);
+    d->response = p;
+    d->response_capacity = size;
+    return 0;
+}
+
+static int nd_rpc_receive(struct nd_dev *d, u8 *buf, size_t length)
+{
+    int n;
+    while (length) {
+        n = nd_exchange(d, ND_CMD_RPC_IN, 0, NULL,
+                         min_t(size_t, length, ND_MAX_READ));
+        if (n <= 0)
+            return n ? n : -EPROTO;
+        memcpy(buf, d->rx + sizeof(struct nd_response), n);
+        buf += n;
+        length -= n;
+    }
+    return 0;
+}
+
+static int nd_runtime_transaction(struct nd_dev *d)
+{
+    u8 header[ND_RPC_HEADER_SIZE];
+    size_t offset = 0, bytes;
+    u32 payload;
+    int ret;
+
+    /* HELLO begins a new executor session. Invalidates stale board fds and
+     * drains any interrupted transaction before a fresh runtime connects.
+     */
+    if (get_unaligned_le32(d->frame + 4) == ND_RPC_HELLO) {
+        ret = nd_exchange(d, ND_CMD_RPC_RESET, 0, NULL, 0);
+        if (ret < 0)
+            return ret;
+    }
+    while (offset < d->frame_size) {
+        bytes = min_t(size_t, d->frame_size - offset, ND_MAX_READ);
+        ret = nd_exchange(d, ND_CMD_RPC_OUT, 0, d->frame + offset, bytes);
+        if (ret < 0)
+            return ret;
+        offset += bytes;
+    }
+    ret = nd_rpc_receive(d, header, sizeof(header));
+    if (ret)
+        return ret;
+    payload = get_unaligned_le32(header + 16);
+    if (memcmp(header, d->frame, 12) || get_unaligned_le32(header + 20) ||
+        payload > ND_RPC_MAX_BODY)
+        return -EPROTO;
+    ret = nd_response_space(d, sizeof(header) + payload);
+    if (ret)
+        return ret;
+    memcpy(d->response, header, sizeof(header));
+    ret = nd_rpc_receive(d, d->response + sizeof(header), payload);
+    if (ret)
+        return ret;
+    d->response_size = sizeof(header) + payload;
+    d->response_offset = 0;
+    return 0;
+}
+
+static int nd_legacy_transaction(struct nd_dev *d)
+{
+    struct nd_driver_command cmd;
+    int n, ret;
+    memcpy(&cmd, d->header, sizeof(cmd));
+    if (cmd.magic != ND_DRIVER_MAGIC || cmd.command != ND_DRIVER_CMD_READ ||
+        !cmd.length || cmd.length > ND_MAX_READ)
+        return -EINVAL;
+    n = nd_exchange(d, ND_CMD_READ, cmd.sector, NULL, cmd.length);
+    if (n < 0)
+        return n;
+    ret = nd_response_space(d, sizeof(struct nd_response) + n);
+    if (ret)
+        return ret;
+    d->response_size = sizeof(struct nd_response) + n;
+    d->response_offset = 0;
+    memcpy(d->response, d->rx, d->response_size);
+    return 0;
+}
+
+static ssize_t nd_write(struct file *f, const char __user *buf,
+                         size_t count, loff_t *pos)
+{
+    size_t used = 0, chunk;
+    u32 magic, payload;
+    int ret = 0;
+    mutex_lock(&nd_lock);
+    if (!nd) { ret = -ENODEV; goto out; }
+    if (nd->response_size != nd->response_offset) { ret = -EBUSY; goto out; }
+    if (!nd->in_ep) { ret = -EOPNOTSUPP; goto out; }
+    while (used < count) {
+        if (!nd->frame) {
+            chunk = min(count - used, nd->header_need - nd->header_used);
+            if (copy_from_user(nd->header + nd->header_used, buf + used, chunk)) {
+                ret = -EFAULT; goto reset;
+            }
+            used += chunk;
+            nd->header_used += chunk;
+            if (nd->header_used != nd->header_need)
+                continue;
+            if (nd->header_need == 4) {
+                magic = get_unaligned_le32(nd->header);
+                if (magic == ND_RPC_MAGIC)
+                    nd->header_need = ND_RPC_HEADER_SIZE;
+                else if ((magic & 0xffff) == ND_DRIVER_MAGIC)
+                    nd->header_need = sizeof(struct nd_driver_command);
+                else { ret = -EPROTO; goto reset; }
+                continue;
+            }
+            if (nd->header_need == sizeof(struct nd_driver_command)) {
+                ret = nd_legacy_transaction(nd);
+                goto complete;
+            }
+            payload = get_unaligned_le32(nd->header + 16);
+            if (payload > ND_RPC_MAX_BODY || get_unaligned_le32(nd->header + 12) ||
+                get_unaligned_le32(nd->header + 20)) {
+                ret = -EPROTO; goto reset;
+            }
+            nd->frame_size = ND_RPC_HEADER_SIZE + payload;
+            nd->frame = kvmalloc(nd->frame_size, GFP_KERNEL);
+            if (!nd->frame) { ret = -ENOMEM; goto reset; }
+            memcpy(nd->frame, nd->header, ND_RPC_HEADER_SIZE);
+            nd->frame_used = ND_RPC_HEADER_SIZE;
+        }
+        chunk = min(count - used, nd->frame_size - nd->frame_used);
+        if (chunk && copy_from_user(nd->frame + nd->frame_used, buf + used, chunk)) {
+            ret = -EFAULT; goto reset;
+        }
+        used += chunk;
+        nd->frame_used += chunk;
+        if (nd->frame_used != nd->frame_size)
+            continue;
+        ret = nd_runtime_transaction(nd);
+complete:
+        nd_clear_request(nd);
+        if (!ret)
+            wake_up_interruptible(&nd_read_wait);
+        break;
+reset:
+        nd_clear_request(nd);
+        break;
+    }
+out:
+    mutex_unlock(&nd_lock);
+    return ret ? ret : used;
+}
+
+static ssize_t nd_read(struct file *f, char __user *buf, size_t count, loff_t *pos)
+{
+    ssize_t ret;
+    if (!count)
+        return 0;
+    mutex_lock(&nd_lock);
+    if (!nd) { ret = -ENODEV; goto out; }
+    count = min(count, nd->response_size - nd->response_offset);
+    if (!count) { ret = -EAGAIN; goto out; }
+    if (copy_to_user(buf, nd->response + nd->response_offset, count)) {
+        ret = -EFAULT; goto out;
+    }
+    nd->response_offset += count;
+    ret = count;
+out:
+    mutex_unlock(&nd_lock);
+    return ret;
+}
+static __poll_t nd_poll(struct file *f, poll_table *wait)
+{
+    __poll_t mask;
+    poll_wait(f, &nd_read_wait, wait);
+    mutex_lock(&nd_lock);
+    if (!nd)
+        mask = EPOLLERR | EPOLLHUP;
+    else if (nd->response_size > nd->response_offset)
+        mask = EPOLLIN | EPOLLRDNORM;
+    else
+        mask = EPOLLOUT | EPOLLWRNORM;
+    mutex_unlock(&nd_lock);
+    return mask;
+}
+static const struct file_operations nd_fops = {
+    .owner = THIS_MODULE, .read = nd_read, .write = nd_write, .poll = nd_poll,
+    .llseek = no_llseek,
+};
+static struct miscdevice nd_misc = {
+    .minor = MISC_DYNAMIC_MINOR, .name = "nd0", .fops = &nd_fops,
+};
+static int nd_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+    struct nd_dev *d;
+    struct usb_host_interface *alt = intf->cur_altsetting;
+    int i, ret;
+    mutex_lock(&nd_lock);
+    if (nd) { ret = -EBUSY; goto out; }
+    d = kzalloc(sizeof(*d), GFP_KERNEL);
+    if (!d) { ret = -ENOMEM; goto out; }
+    d->udev = usb_get_dev(interface_to_usbdev(intf));
+    d->header_need = 4;
+    for (i = 0; i < alt->desc.bNumEndpoints; ++i) {
+        struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
+        if (usb_endpoint_is_bulk_in(ep)) d->in_ep = ep->bEndpointAddress;
+        if (usb_endpoint_is_bulk_out(ep)) d->out_ep = ep->bEndpointAddress;
+    }
+    if (!d->out_ep) { ret = -ENODEV; goto free; }
+    ret = misc_register(&nd_misc);
+    if (ret) goto free;
+    nd = d;
+    usb_set_intfdata(intf, d);
+    dev_info(&intf->dev, "ND READ and runtime stream: /dev/nd0\n");
+    goto out;
+free:
+    usb_put_dev(d->udev);
+    kfree(d);
+out:
+    mutex_unlock(&nd_lock);
+    return ret;
+}
+static void nd_disconnect(struct usb_interface *intf)
+{
+    struct nd_dev *d;
+    mutex_lock(&nd_lock);
+    d = usb_get_intfdata(intf);
+    usb_set_intfdata(intf, NULL);
+    if (nd == d) {
+        misc_deregister(&nd_misc);
+        nd = NULL;
+    }
+    if (d) {
+        nd_clear_request(d);
+        kvfree(d->response);
+        usb_put_dev(d->udev);
+        kfree(d);
+    }
+    mutex_unlock(&nd_lock);
+    wake_up_interruptible(&nd_read_wait);
+}
+static const struct usb_device_id nd_ids[] = {
+    { USB_DEVICE_AND_INTERFACE_INFO(0x2207, 0x0000, USB_CLASS_VENDOR_SPEC, 0, 0) },
     { }
 };
-
-MODULE_DEVICE_TABLE(usb, nd_usb_ids);
-
-
-/* -------------------------------------------------------------------------- */
-/* USB driver                                                                 */
-/* -------------------------------------------------------------------------- */
-
-static struct usb_driver nd_usb_driver = {
-    .name       = "nd_host",
-    .probe      = nd_probe,
-    .disconnect = nd_disconnect,
-    .id_table   = nd_usb_ids,
+MODULE_DEVICE_TABLE(usb, nd_ids);
+static struct usb_driver nd_usb = {
+    .name = "nd_host", .probe = nd_probe, .disconnect = nd_disconnect,
+    .id_table = nd_ids,
 };
-
-
-/* -------------------------------------------------------------------------- */
-/* Module init / exit                                                         */
-/* -------------------------------------------------------------------------- */
-
-static int __init nd_init(void)
-{
-    int ret;
-
-    /*
-     * 注意：
-     *
-     * 這裡不再 misc_register(&nd_device)。
-     *
-     * insmod 只註冊 USB driver。
-     * /dev/nd0 要等 f_nd 被 probe 到才建立。
-     */
-    ret = usb_register(&nd_usb_driver);
-
-    if (ret) {
-
-        pr_err("nd: failed to register USB driver: %d\n",
-               ret);
-
-        return ret;
-    }
-
-    pr_info("nd: USB driver registered\n");
-
-    return 0;
-}
-
-
-static void __exit nd_exit(void)
-{
-    /*
-     * 如果 f_nd 還存在，
-     * usb_deregister() 會觸發 disconnect，
-     * disconnect 再負責 misc_deregister()。
-     */
-    usb_deregister(&nd_usb_driver);
-
-    pr_info("nd: USB driver unloaded\n");
-}
-
-
-module_init(nd_init);
-module_exit(nd_exit);
-
-
+module_usb_driver(nd_usb);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Luckfox Near-Data Project");
-MODULE_DESCRIPTION("Near-Data USB host driver");
+MODULE_DESCRIPTION("ND USB READ and runtime byte-stream host transport");

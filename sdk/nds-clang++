@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Compiler wrapper: SDK paths and host libraries only; no implicit target."""
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+
+def main():
+ args=sys.argv[1:]
+ if '--' in args:
+  sys.exit('nds-clang++: -- separator is not supported yet; use ./ for filenames beginning with a dash')
+ show='--show' in args
+ if show:args.remove('--show')
+ prefix=Path(__file__).resolve().parent.parent
+ config=prefix/'share/nds-sdk/wrapper.json'
+ try:cfg=json.loads(config.read_text())
+ except (OSError,ValueError) as e:sys.exit(f'nds-clang++: cannot read {config}: {e}')
+ prefix=Path(cfg.get('prefix',str(prefix)))
+ # Expand response files for phase detection only; clang receives originals.
+ def expanded(items,depth=0):
+  if depth>16:raise ValueError('response files nested too deeply')
+  result=[]
+  for item in items:
+   if item.startswith('@'):
+    result.extend(expanded(shlex.split(Path(item[1:]).read_text()),depth+1))
+   else:result.append(item)
+  return result
+ try:scan=expanded(args)
+ except (OSError,ValueError) as e:sys.exit(f'nds-clang++: {e}')
+ compile_only=any(x in scan for x in ['-c','-S','-E','-fsyntax-only','-M','-MM'])
+ query=not scan or any(x in scan for x in ['--version','--help','-help','-dumpmachine','-dumpversion']) or any(x.startswith('-print-') for x in scan)
+ no_libs=any(x in scan for x in ['-nostdlib','-nodefaultlibs'])
+ cmd=[cfg['compiler']]
+ if not query:cmd+=['-I'+str(prefix/'include')]
+ cmd+=args
+ if not compile_only and not query and not no_libs:
+  # NDS device linking uses platform libraries; these are Guest host libs.
+  cmd+=['-L'+str(prefix/'lib'),'-Wl,-rpath,'+str(prefix/'lib'),'-lnd','-lnd_runtime','-pthread']
+ if show:print(shlex.join(cmd));return
+ os.execv(cmd[0],cmd)
+if __name__=='__main__':main()

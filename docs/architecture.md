@@ -6,17 +6,18 @@
 
 ```text
 test_nd → libnd / FIEMAP → write(/dev/nd0)
-        → Host nd_driver → USB Bulk OUT → Luckfox f_nd → SD block read / kernel log
+        → Host nd_driver → USB Bulk OUT → Luckfox f_nd worker → SD read
+        ← buffer ← /dev/nd0 read/poll ← USB Bulk IN response ←
 ```
 
 Host character-device command 在 `include/nd_driver.h`，USB wire command 在
 `include/nd_protocol.h`。Host driver 將前者轉成 little-endian USB 命令。
 `/dev/nd0` 是 byte stream，driver 累積完整命令後才傳送，適應分段 write。
-目前 driver 的 read/poll 入口不代表已有資料回傳通路。
+目前 driver 的 read/poll 已提供 response header 與 payload；一次僅支援一個交易。
 
 歷史 QEMU 實驗另曾使用 Guest `/dev/ttyS0` → QEMU serial chardev → Host
-`/dev/nd0`。目前 `src/libnd.cpp` 直接開啟 `/dev/nd0`，沒有自動選用 serial
-transport；不能將該歷史配置當成本 repository 已內建的後端。
+`/dev/nd0`。目前 `src/libnd.cpp` 預設開啟 `/dev/nd0`，可用 `ND_TRANSPORT_PATH=/dev/ttyS0`
+選用 raw serial transport。2026-10-20 已重新驗證 Guest buffer 回填。
 
 ## Host driver
 
@@ -56,8 +57,12 @@ partition、設定 gadget 並綁定 UDC。UMS export 期間，裝置端不得同
 ## 原型限制
 
 - `nd_read` 只使用第一個 extent，固定 partition 起點為 sector 4096。
-- 成功回傳 count 代表請求送出，不代表讀取 buffer 已填入。
+- 成功回傳實際回填 buffer 的 bytes，count 超過檔案大小時短讀。
 - libnd 不適用尚未處理的 LVM/device-mapper、fragmented file 等一般化映射。
-- device response、guest buffer 回填、多 extent、完整邊界與一致性防護仍待完成。
+- 最小 device response 與 Guest buffer 回填已驗證；多 extent、offset API、完整邊界與一致性防護仍待完成。
 - OpenMP runtime / executor 尚未完成。工具鏈可編譯 ARM ELF，不等於 offload
   runtime image 或板卡執行已通過。
+
+## 2026-10-20 實機重驗
+
+目前硬體、WSL BTF 修復、QEMU 命令與已驗證範圍見 [實機基線](hardware-baseline-2026-10-20.md)。基線核對後已加入並驗證最小 SD 讀取與 response，見 [回傳原型](nd-response-prototype.md)。

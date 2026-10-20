@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "nd_device.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,12 +22,14 @@ typedef struct nd_extent {
 /* Open a regular file read-only and obtain its FIEMAP extents. */
 nd_file *nd_open(const char *path);
 
-/*
- * 第一階段：把第一個 extent 轉成 SD sector，經 write(/dev/nd0) 送到 Luckfox。
- * 成功回傳 count，代表請求已送達；此時不會寫入 buffer。
- * 失敗回傳 -1。
+/* Read file bytes directly from exported SD into a public nd_alloc buffer.
+ * Returns actual bytes (clamped at EOF), or -1 with errno. First extent only;
+ * unsupported FIEMAP mappings are rejected. offset is a file byte offset.
+ * The destination allocation identifies the shared device session.
  */
-int64_t nd_read(nd_file *file, void *buffer, size_t count);
+int64_t nd_read(nd_file *file, uint64_t offset, size_t count, nd_device_ptr destination);
+/* Legacy SD -> host-buffer probe, retained under an explicit legacy name. */
+int64_t nd_read_host_legacy(nd_file *file, void *buffer, size_t count);
 
 /* Close the file and release its resources. */
 int nd_close(nd_file *file);

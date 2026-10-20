@@ -94,3 +94,32 @@ The SDK target triple belongs in PlatformConfig; the offload target vendor is
 
 LEO-22 should remain in progress: the GCC/platform baseline is verified, but
 its complete runtime-image acceptance criteria are not satisfied.
+
+## 2026-10-20 M4 follow-up
+
+- `tests/luckfox-sdk/validate_driver.py` verifies explicit/buildroot selection and missing option, unknown key, missing required key, invalid layout diagnostics. All six cases pass, including after the Windows Clang incremental rebuild. LEO-20 and LEO-21 are Done; their historical descriptions were stale.
+- `image_probe.c` compiled with the real SDK GCC and `-ldl` loads the prior `nds-add.so` on Luckfox using dlopen/dlsym. Actual output: `NDS ARM image result=42 expected=42`, exit 0. Evidence: `artifacts/luckfox-sdk/board-image-probe.log`. This verifies ordinary ARM shared-ELF ABI/loading/function execution, not OpenMP outlined-region execution.
+- Added PlatformConfig library-directory forwarding to `nds::Linker::ConstructJob`; Clang rebuild passes. Current full/device-shared dry runs still do not invoke this linker, so this is not yet an end-to-end linker/image validation.
+- Remaining LEO-22 work: wire the device image link into the actual offload pipeline; resolve ARM32 frontend support and the 64-bit host/32-bit device ABI; agree on the runtime image representation. The old SYLPH runtime expects a custom header plus ELF path, whereas the current linker emits raw ELF.
+- Runtime loading/transport/execution integration is LEO-23/24; the full OpenMP example is LEO-25. These now depend on the required prototype capabilities rather than completion of every M3 protocol/multi-extent hardening item.
+
+Recheck driver configuration on Windows:
+
+```powershell
+# Use an installed Python interpreter.
+python tests/luckfox-sdk/validate_driver.py
+```
+
+Build the isolated board loader in WSL:
+
+```sh
+/sdk/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc \
+  -mcpu=cortex-a7 -mfpu=vfpv4-d16 -mfloat-abi=hard -Os \
+  tests/luckfox-sdk/image_probe.c -ldl -o artifacts/luckfox-sdk/image-probe
+```
+
+Place `image-probe` and `nds-add.so` under `/tmp/nd-m4` on the board, then:
+
+```sh
+/tmp/nd-m4/image-probe /tmp/nd-m4/nds-add.so
+```
