@@ -10,16 +10,19 @@ int main(int argc, char **argv) {
  int32_t input[3] = {7, 19, 42}, output[3] = {0};
  int result = 1;
  if (nd_alloc(d, sizeof input, &p) ||
-     nd_submit(d, p, input, sizeof input) ||
-     nd_retrieve(d, output, p, sizeof output)) goto done;
+     nd_copy(d, p, input, sizeof input, ND_HOST_TO_DEVICE) ||
+     nd_copy(d, output, p, sizeof output, ND_DEVICE_TO_HOST)) goto done;
  for (int i = 0; i < 3; ++i) if (input[i] != output[i]) goto done;
+ errno = 0;
+ if (nd_copy(d, output, p, sizeof output, (nd_copy_kind)0) != -1 || errno != EINVAL)
+  goto done;
  /* Device reports an invalid range; the session must remain usable. */
  errno = 0;
- if (nd_retrieve(d, output, p + sizeof input, sizeof output) != -1 || errno != EFAULT)
+ if (nd_copy(d, output, (void *)((uintptr_t)p + sizeof input), sizeof output, ND_DEVICE_TO_HOST) != -1 || errno != EFAULT)
   goto done;
- if (nd_retrieve(d, output, p, sizeof output)) goto done;
+ if (nd_copy(d, output, p, sizeof output, ND_DEVICE_TO_HOST)) goto done;
  result = 0;
- puts("PASS: public device API roundtrip and range error recovery");
+ puts("PASS: public void-pointer nd_copy roundtrip, invalid direction and range recovery");
 done:
  if (result) fprintf(stderr, "device API failure: %s\n", nd_device_error(d));
  if (p && nd_free(d, p)) result = 1;

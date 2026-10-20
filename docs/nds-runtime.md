@@ -154,7 +154,7 @@ Guest `make nds-usb-check NDS_JOBS=6` 退出碼 0；MANDATORY offload 的 delta=
 
 ## 公開裝置記憶體 API
 
-`#include <nd_device.h>`（亦由 `nd.h` 引入）提供 `nd_device_open/close/error/bits`、`nd_alloc/free/submit/retrieve`。這些 API 直接共用既有 nd_rt 實作；`nd_device` 是 `nd_runtime` 的別名，不另建 protocol 或配置表。已有 runtime session 時，直接將它傳給公開 API，不要為同一裝置再 open 一次。OpenMP plugin 尚未提供借用其 session 的公開入口，故目前不能各自 open 後混用 allocation。
+`#include <nd_device.h>`（亦由 `nd.h` 引入）提供 `nd_device_open/close/error/bits`、`nd_alloc/free/copy`。這些 API 直接共用既有 nd_rt 實作；`nd_device` 是 `nd_runtime` 的別名，不另建 protocol 或配置表。已有 runtime session 時，直接將它傳給公開 API，不要為同一裝置再 open 一次。OpenMP plugin 尚未提供借用其 session 的公開入口，故目前不能各自 open 後混用 allocation。
 
 ```c
 nd_device *device = nd_device_open("/dev/ttyS0");
@@ -162,13 +162,13 @@ nd_device_ptr address;
 int32_t input = 42, output = 0;
 /* Production callers must check each return value. */
 nd_alloc(device, sizeof input, &address);
-nd_submit(device, address, &input, sizeof input);
-nd_retrieve(device, &output, address, sizeof output);
+nd_copy(device, address, &input, sizeof input, ND_HOST_TO_DEVICE);
+nd_copy(device, &output, address, sizeof output, ND_DEVICE_TO_HOST);
 nd_free(device, address);
 nd_device_close(device);
 ```
 
-Device address 為 uint64_t，不可在 host 解參考；只可在 allocation 範圍內加 byte offset。操作為同步，成功回傳 0，失敗 -1 並設定 errno。close 不得與操作並行，應先 free；reset 後 address 失效。現有 `nd_open/nd_read` 仍是 FIEMAP 與 host-buffer READ API，並未改為讀到 device address；`is_device_ptr` 的 OpenMP 串接亦尚未完成。
+公開 device address 為不透明 void*（nd_device_ptr），僅支援 64-bit Guest，不可在 host 解參考；使用 uintptr_t 在 allocation 範圍內計算 byte offset。Wire 仍為固定 uint64_t，轉換僅針對 nd_copy direction 指定的 device operand。nd_copy 目前支援 ND_HOST_TO_DEVICE、ND_DEVICE_TO_HOST，其他方向回報 EINVAL。操作為同步，成功回傳 0，失敗 -1 並設定 errno。close 不得與操作並行，應先 free；reset 後 address 失效。現有 `nd_open/nd_read` 仍是 FIEMAP 與 host-buffer READ API，並未改為讀到 device address；`is_device_ptr` 的 OpenMP 串接亦尚未完成。
 
 ```sh
 make runtime-install PREFIX=/tmp/nd-sdk
@@ -182,3 +182,5 @@ make device-api-check ND_USB_TRANSPORT=/dev/ttyS0
 安裝提供 nd_device.h、nd_runtime.h、libnd_runtime.a 與 shared library；不包含舊 FIEMAP libnd。公開 API 可從靜態或動態 runtime 連結，不能在不同 library 副本之間自行建立第二條裝置 session。
 
 公開 API 驗證：Guest `make device-api-check ND_USB_TRANSPORT=/dev/ttyS0` 退出碼 0，靜態連結範例的 roundtrip 與越界錯誤恢復 PASS；既有 USB OpenMP delta=7 回歸 PASS。Native image/launch 測試、安裝後 C 靜態連結及 C++ header 編譯皆 PASS。
+
+void* / nd_copy 更新驗證：Guest USB `make device-api-check ND_USB_TRANSPORT=/dev/ttyS0` 退出碼 0，雙向 copy、無效方向 EINVAL、越界 EFAULT 及錯誤後連線恢復均 PASS；C/C++ 嚴格編譯、安裝後靜態連結及 native runtime image/launch 回歸 PASS。公開 nd_submit/nd_retrieve 已由 nd_copy 取代，內部 nd_rt_submit/nd_rt_retrieve 保留。
