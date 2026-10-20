@@ -151,3 +151,34 @@ Guest port 為 `/dev/virtio-ports/nds-runtime`；首次需由管理端賦予 dev
 Guest `make nds-usb-check NDS_JOBS=6` 退出碼 0；MANDATORY offload 的 delta=7/19 皆 PASS，kernel 回報指標 32 bits，int32/float/double vector 元素逐項符合 host reference。Guest `make runtime-usb-check ND_USB_TRANSPORT=/dev/ttyS0` 退出碼 0，1/4/496/512/4096/8193 bytes 回傳及越界錯誤回報皆 PASS。WSL 直連 USB 測試與三組 legacy READ 比對亦 PASS。
 
 新版 kernel 為 5.10.160 #6；boot 寫入後讀回逐位元組相符。測試紀錄保存在 `artifacts/usb-runtime/guest-make.log`、`guest-make.rc`、`guest-smoke.log`、`guest-smoke.rc`（本機與 Guest）。QEMU 未啟動 UART runtime bridge。此結果涵蓋目前支援的 mapped buffers，不代表深層 mapping 或全部 OpenMP 語意已實作。
+
+## 公開裝置記憶體 API
+
+`#include <nd_device.h>`（亦由 `nd.h` 引入）提供 `nd_device_open/close/error/bits`、`nd_alloc/free/submit/retrieve`。這些 API 直接共用既有 nd_rt 實作；`nd_device` 是 `nd_runtime` 的別名，不另建 protocol 或配置表。已有 runtime session 時，直接將它傳給公開 API，不要為同一裝置再 open 一次。OpenMP plugin 尚未提供借用其 session 的公開入口，故目前不能各自 open 後混用 allocation。
+
+```c
+nd_device *device = nd_device_open("/dev/ttyS0");
+nd_device_ptr address;
+int32_t input = 42, output = 0;
+/* Production callers must check each return value. */
+nd_alloc(device, sizeof input, &address);
+nd_submit(device, address, &input, sizeof input);
+nd_retrieve(device, &output, address, sizeof output);
+nd_free(device, address);
+nd_device_close(device);
+```
+
+Device address 為 uint64_t，不可在 host 解參考；只可在 allocation 範圍內加 byte offset。操作為同步，成功回傳 0，失敗 -1 並設定 errno。close 不得與操作並行，應先 free；reset 後 address 失效。現有 `nd_open/nd_read` 仍是 FIEMAP 與 host-buffer READ API，並未改為讀到 device address；`is_device_ptr` 的 OpenMP 串接亦尚未完成。
+
+```sh
+make runtime-install PREFIX=/tmp/nd-sdk
+cc examples/device_memory.c -I/tmp/nd-sdk/include \
+  /tmp/nd-sdk/lib/libnd_runtime.a -pthread -o /tmp/device_memory
+/tmp/device_memory /dev/ttyS0
+# 或在 Guest checkout：
+make device-api-check ND_USB_TRANSPORT=/dev/ttyS0
+```
+
+安裝提供 nd_device.h、nd_runtime.h、libnd_runtime.a 與 shared library；不包含舊 FIEMAP libnd。公開 API 可從靜態或動態 runtime 連結，不能在不同 library 副本之間自行建立第二條裝置 session。
+
+公開 API 驗證：Guest `make device-api-check ND_USB_TRANSPORT=/dev/ttyS0` 退出碼 0，靜態連結範例的 roundtrip 與越界錯誤恢復 PASS；既有 USB OpenMP delta=7 回歸 PASS。Native image/launch 測試、安裝後 C 靜態連結及 C++ header 編譯皆 PASS。

@@ -164,3 +164,12 @@ runtime-usb-bundle: runtime-arm
 
 nds-usb-check: ND_RUNTIME_DEVICE_PATH=/dev/ttyS0
 nds-usb-check: nds-check
+
+# Public host API, statically linked to the same runtime used by the plugin.
+.PHONY: device-api-check runtime-install
+$(BUILD)/device_memory: examples/device_memory.c include/nd_device.h runtime
+	$(CC) $(CPPFLAGS) -Wall -Wextra $< $(BUILD)/runtime/libnd_runtime.a -pthread -o $@
+device-api-check: $(BUILD)/device_memory
+	$(BUILD)/device_memory $(ND_USB_TRANSPORT)
+runtime-install: runtime
+	cmake --install $(BUILD)/runtime $(if $(PREFIX),--prefix "$(PREFIX)",)

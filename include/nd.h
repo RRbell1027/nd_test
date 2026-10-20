@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "nd_device.h"
 
 #ifdef __cplusplus
 extern "C" {
