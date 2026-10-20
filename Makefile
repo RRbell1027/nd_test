@@ -192,3 +192,9 @@ nds-file-check: nds-file-compile
 .PHONY: runtime-file-check
 runtime-file-check: runtime
 	python3 tests/runtime/file_device.py $(BUILD)/runtime
+
+# Physical SD mode: Guest changes persist on the card, without an overlay.
+.PHONY: guest-direct-start
+ND_GUEST_DISK ?= /dev/sdd
+guest-direct-start:
+	python3 tests/guest/start_direct.py --disk $(ND_GUEST_DISK) --transport $(ND_USB_TRANSPORT)

@@ -195,7 +195,7 @@ make nds-file-check NDS_JOBS=6 NDS_INPUT_FILE=/usr/share/common-licenses/GPL-3
 make runtime-file-check
 ```
 
-檔案必須位於 Luckfox 匯出的同一張 SD，且執行時不得修改檔案或 extent。預設 partition start 仍為本卡已驗證的 4096 sectors（ND_PARTITION_START_SECTOR 可覆寫）；executor 預設 /dev/mmcblk1。QEMU overlay 新建／修改的檔案不在板端原始 SD，不能用作 direct SD read 輸入。測試使用原有 SD 檔案，先與 Guest pread 比對，再計算。
+檔案必須位於 Luckfox 匯出的同一張 SD，且執行時不得修改檔案或 extent。預設 partition start 仍為本卡已驗證的 4096 sectors（ND_PARTITION_START_SECTOR 可覆寫）；executor 預設 /dev/mmcblk1。先前 qcow2 overlay 新建／修改的檔案不在板端原始 SD；目前已改成直接 raw SD 模式，因此 Guest 新增檔案 flush/fsync 後亦可作輸入。切換與啟動方式見 [guest-direct-sd.md](guest-direct-sd.md)。測試先與 Guest host reference 比對，再計算。
 
 Executor 僅接收實體 offset、長度與已登記的 device allocation，不接收 host 檔案內容。ND_STORAGE_PATH 可為 executor 指定 storage，native 整合測試使用 sparse image；板端 service 預設保持 /dev/mmcblk1。
 

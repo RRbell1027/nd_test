@@ -112,4 +112,4 @@ through QEMU and WSL `/dev/nd0`, USB `f_nd`, and board `/dev/nd_rpc`.
 Use `make nds-usb-check`; UART remains available for board management. See
 [docs/nds-runtime.md](docs/nds-runtime.md) for setup and supported types.
 
-Guest SD 直接運算範例：`make nds-file-check NDS_JOBS=6`，見 [examples/omp_file_read.cpp](examples/omp_file_read.cpp)。公開 libnd 與 OpenMP plugin 共用 `libnd_runtime.so` session；輸入須是實際 SD 上的檔案，不能只存在 QEMU overlay。
+Guest SD 直接運算範例：`make nds-file-check NDS_JOBS=6`，見 [examples/omp_file_read.cpp](examples/omp_file_read.cpp)。公開 libnd 與 OpenMP plugin 共用 `libnd_runtime.so` session。Guest 已改為直接使用實體 SD，新增檔案同步後也可供 Luckfox 讀取；啟動方式見 [直接 SD 模式](docs/guest-direct-sd.md)。

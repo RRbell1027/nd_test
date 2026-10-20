@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
   }
   std::puts("PASS: SD direct read matches Guest pread, offset=3");
   errno=0;
-  if(nd_read(file,Offset,Bytes+1,device_ptr)!=-1||errno!=EFAULT)return false;
+  if(nd_read(file,Offset,Bytes,reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(device_ptr)+1))!=-1||errno!=EFAULT)return false;
   if(nd_read(file,nd_file_size(file),Bytes,device_ptr)!=0)return false;
   float *data=static_cast<float *>(device_ptr);
   for(int round=0;round<2;++round) {
