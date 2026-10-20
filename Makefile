@@ -130,3 +130,16 @@ nds-check: nds-compile
 
 runtime-uart-bridge:
 	python3 runtime/uart_bridge.py --uart $(or $(NDS_UART),/dev/ttyUSB0) --socket $(NDS_BRIDGE_SOCKET)
+
+# Luckfox executor cross-build inside Guest; ARM libffi comes from board SDK.
+NDS_DEVICE_CC ?= $(HOME)/nds-sdk/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc
+NDS_DEVICE_FFI_ROOT ?= $(HOME)/nds-sdk/arm-libffi
+NDS_BRIDGE_SOCKET ?= /tmp/nds-runtime-bridge.sock
+.PHONY: runtime-arm
+runtime-arm:
+	test -f $(NDS_DEVICE_FFI_ROOT)/include/ffi.h
+	mkdir -p $(BUILD)/runtime/arm
+	$(NDS_DEVICE_CC) -std=c11 -Os -s -mcpu=cortex-a7 -mfpu=vfpv4-d16 -mfloat-abi=hard \
+		-I$(NDS_DEVICE_FFI_ROOT)/include runtime/executor.c \
+		-L$(NDS_DEVICE_FFI_ROOT)/lib -Wl,-rpath,/usr/lib -lffi -ldl \
+		-o $(BUILD)/runtime/arm/nd-executor
