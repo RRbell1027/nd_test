@@ -26,10 +26,20 @@ for name, flags, suffix in [('device-object', ['--offload-device-only', '-c'], '
     cmd = base + flags + ['-o', str(output)]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (out / (name + '.log')).write_bytes(proc.stdout)
-    ok = proc.returncode == 0 and output.is_file() and output.stat().st_size > 0
-    results[name] = {'command': cmd, 'exit': proc.returncode, 'pass': ok}
+    content = output.read_bytes() if output.is_file() else b''
+    elf = None
+    if len(content) >= 20 and content[:4] == b'\x7fELF' and content[5] == 1:
+        elf = {'class': content[4], 'type': int.from_bytes(content[16:18], 'little'),
+               'machine': int.from_bytes(content[18:20], 'little')}
+    expected = {'class': 2, 'type': 1, 'machine': 62} if name == 'host-device-object' else {
+        'class': 1, 'type': 3 if name == 'device-shared' else 1, 'machine': 40}
+    embedded = name != 'host-device-object' or b'.llvm.offloading' in content
+    ok = proc.returncode == 0 and elf == expected and embedded
+    results[name] = {'command': cmd, 'exit': proc.returncode, 'pass': ok,
+                     'elf': elf, 'expected_elf': expected, 'offload_section': embedded}
     print(('PASS' if ok else 'FAIL') + ': ' + name + ' exit=' + str(proc.returncode), flush=True)
     if not ok:
+        print('Artifact:', elf, 'expected:', expected, 'offload section:', embedded, flush=True)
         print(proc.stdout.decode(errors='replace'), flush=True)
 (out / 'manifest.json').write_text(json.dumps(results, indent=2))
 raise SystemExit(0 if all(r['pass'] for r in results.values()) else 1)
