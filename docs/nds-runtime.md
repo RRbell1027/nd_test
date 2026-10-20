@@ -100,4 +100,4 @@ Windows 開發環境可用 `tests/runtime/compile_plugin.py` 搭配既有 LLVM b
 - 通訊使用 64-bit device address/handle，由 executor 解析成原生指標；host 指標不可直接截短使用。
 - 第一版目標為固定寬度整數、float、double，以及以 data()/元素數量映射的 vector 連續元素；不是直接映射 std::vector 物件。
 - 跨裝置資料避免 long、unsigned long、size_t、ptrdiff_t、long double；含指標 struct、巢狀 vector 與深層 mapping 暫不支援。這些是使用規範，不新增 frontend 型別拒絕。
-- frontend 僅針對 NDS vendor + ARM32 開放 target 與不同指標寬度；其他 target 保留原有檢查。開放檢查不代表參數 ABI 或完整 offload 已驗證。
+- frontend 針對 NDS vendor 的已知架構開放 target 與不同指標寬度；未知架構及非 NDS target 保留原有檢查。開放檢查不代表參數 ABI 或完整 offload 已驗證。
