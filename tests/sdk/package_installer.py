@@ -16,6 +16,8 @@ with tempfile.TemporaryDirectory() as temp:
  def elf(machine):
   b=bytearray(20);b[:6]=b'\x7fELF\x02\x01';struct.pack_into('<H',b,18,machine);return bytes(b)
  (sdk/'llvm/bin/clang++').write_bytes(elf(40))
+ for name in ['clang-linker-wrapper','clang-offload-packager']:(sdk/'llvm/bin'/name).write_bytes(elf(62))
+ resource=sdk/'llvm/lib/clang/21/include';resource.mkdir(parents=True);(resource/'stddef.h').write_text('')
  shutil.copy2(root/'sdk/nds-clang++',sdk/'bin/nds-clang++')
  for n in ['nd.h','nd_device.h','nd_runtime.h']:(sdk/'include'/n).write_text('')
  for n in ['libnd.so','libnd_runtime.so','libomp.so','libomptarget.so']:(sdk/'lib'/n).write_bytes(elf(62))

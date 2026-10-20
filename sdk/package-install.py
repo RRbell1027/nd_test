@@ -25,12 +25,15 @@ def install():
   p.error('this SDK requires an amd64/x86_64 Linux host')
  compiler=sdk/'llvm/bin/clang++'
  wrapper=sdk/'bin/nds-clang++'
- required=[compiler,wrapper,sdk/'include/nd.h',sdk/'include/nd_device.h',sdk/'include/nd_runtime.h']
+ tools=[sdk/'llvm/bin/clang-linker-wrapper',sdk/'llvm/bin/clang-offload-packager']
+ required=[compiler,wrapper,*tools,sdk/'include/nd.h',sdk/'include/nd_device.h',sdk/'include/nd_runtime.h']
  libraries=['libnd.so','libnd_runtime.so','libomp.so','libomptarget.so']
  required += [sdk/'lib'/name for name in libraries]
  for source in required:
   if not source.is_file():p.error(f'missing SDK file: {source}')
- for source in [compiler,*[sdk/'lib'/name for name in libraries]]:
+ if not list((sdk/'llvm/lib/clang').glob('*/include/stddef.h')):
+  p.error('missing compiler resource headers under llvm/lib/clang')
+ for source in [compiler,*tools,*[sdk/'lib'/name for name in libraries]]:
   with source.open('rb') as f:h=f.read(20)
   if len(h)<20 or h[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',h,18)[0]!=62:
    p.error(f'expected an amd64 ELF binary: {source}')

@@ -2,7 +2,25 @@
 
 這個 installer 安裝已建置的 Guest libraries/headers 與 nds-clang++。不改 Clang driver、不修改 platform，也不自動選擇 OpenMP、target、CPU 或 addrsig。
 
-## 安裝
+## 使用預建 SDK（不編譯 LLVM）
+
+Guest ~/nds-sdk 已包含 lib/、include/ 安裝來源，以及根目錄 install.sh/install.py：
+
+```sh
+cd ~/nds-sdk
+sudo ./install.sh                       # /usr/local
+./install.sh --prefix "$HOME/.local"    # 不需 root；需將 ~/.local/bin 放入 PATH
+```
+
+腳本僅使用這套 SDK 內的成品，不呼叫 CMake，不下載或重建 LLVM，不載入 driver，也不要求接上 Luckfox。
+
+安裝前檢查 Linux/amd64、必要檔案、ELF 架構、offload 工具及 compiler resource headers。將 SDK lib/include 複製到 prefix；覆寫同名檔案前保存到 prefix/share/nds-sdk/backups/<時間>/，另寫 install-manifest.json。預設 /usr/local 執行 ldconfig，最後使用 wrapper 編譯／執行最小 host 程式，驗證 headers、link 與 loader。自訂 prefix 使用自己的 wrapper/config，不更動既有系統 wrapper。
+
+/usr/local 的 wrapper 入口連到 SDK bin；compiler/platform 仍引用 SDK 位置，安裝後請保留 SDK，不宣稱可任意搬移。SDK 原本的 libraries/headers 來源不會被改寫。package-files.json 記錄來源檔案雜湊。
+
+來源 repository 對應 sdk/package-install.sh、sdk/package-install.py；打包時分別放到 SDK 根目錄 install.sh、install.py。
+
+## 從原始碼開發者安裝（既有 build）
 
 在完整 checkout 建置所需元件後安裝：
 
@@ -49,6 +67,9 @@ Wrapper 使用 argv 原樣轉交，不經 shell eval；支援空白路徑與 res
 
 ```text
 /home/dev/nds-sdk/
+  install.sh / install.py    預建成品安裝入口
+  include/                  headers 安裝來源
+  lib/                      ND/OpenMP libraries 安裝來源
   llvm/bin/                 Clang、linker-wrapper、offload-packager
   llvm/lib/clang/21/        compiler resource headers
   arm-rockchip830-linux-uclibcgnueabihf/   ARM cross toolchain/sysroot
@@ -68,3 +89,12 @@ nd_driver 留在 WSL USB host，Guest 使用 ttyS0，不在 Guest 安裝該 kern
 清理前先移開舊路徑測試，清理後再次重新編譯並 USB mandatory offload：direct SD read 及兩輪各 128 個 float 結果 PASS；map delta=7/19 PASS。最後 /home/dev 非隱藏項目只剩 nds-sdk，Clang InstalledDir 與 resource dir 均在其 llvm 目錄。
 
 Wrapper 單元測試：python3 tests/sdk/wrapper.py。
+
+## 預建 installer 實測
+
+- 缺件／錯誤 ARM host ELF 套件：安裝前拒絕，沒有建立目標目錄。
+- 含空白的自訂 prefix、非 root、連續安裝兩次：exit 0；headers/link/loader smoke PASS，覆寫備份存在。
+- /usr/local 重裝：exit 0，ldconfig 與 host smoke PASS。
+- 重裝後完整 USB nd_read → is_device_ptr → nd_copy：編譯及執行 exit 0，SD read 與兩輪 float kernel 結果皆 PASS。
+
+單元測試：python3 tests/sdk/package_installer.py。安裝日誌與真機證據在 artifacts/sdk-package/。
