@@ -1,6 +1,7 @@
 
 #include "nd.h"
 #include "nd_driver.h"
+#include "nd_protocol.h"
 
 #include <cerrno>
 #include <cstddef>
@@ -12,6 +13,10 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <endian.h>
+#include <poll.h>
+#include <termios.h>
+#include <algorithm>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
@@ -219,78 +224,119 @@ extern "C" int64_t nd_read(
         return -1;
     }
 
-    /*
-     * 第一階段限制：
-     * - 只從邏輯位移 0 讀（使用第一個 extent）
-     * - 刻意不寫入 buffer
-     * - Luckfox 把讀到的資料印到 dmesg
-     */
+    if (!count || !file->size)
+        return 0;
     if (file->extents.empty()) {
         errno = EIO;
         return -1;
     }
-
     const nd_extent &extent = file->extents[0];
-
-    constexpr uint64_t sector_size = 512;
-    constexpr uint64_t partition_start_sector = 4096;
-
-    /*
-     * FIEMAP 的 physical_offset 是相對於 /dev/vda2。
-     *
-     * 轉換：
-     *   vda2 實體位元組位移
-     *          ↓
-     *   vda2 sector
-     *          ↓
-     *   SD 卡絕對 sector
-     */
-    if (extent.physical_offset % sector_size != 0) {
-        errno = EIO;
+    count = std::min<uint64_t>(count, file->size);
+    const uint32_t unsafe_flags = FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC |
+        FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED |
+        FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE |
+        FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN;
+    /* Multi-extent slicing is LEO-18; fail before sending an invalid mapping. */
+    if (extent.logical_offset != 0 || count > extent.length ||
+        (extent.flags & unsafe_flags) || extent.physical_offset % 512) {
+        errno = ENOTSUP;
         return -1;
     }
-
-    const uint64_t sector =
-        extent.physical_offset / sector_size
-        + partition_start_sector;
-
-    if (count > UINT32_MAX) {
-        errno = EINVAL;
+    uint64_t partition_start = 4096; // Verified Luckfox SD baseline; configurable.
+    if (const char *value = std::getenv("ND_PARTITION_START_SECTOR")) {
+        char *end = nullptr;
+        errno = 0;
+        partition_start = std::strtoull(value, &end, 10);
+        if (errno || !*value || *value == '-' || !end || *end) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    const uint64_t base_sector = extent.physical_offset / 512;
+    if (partition_start > UINT64_MAX - base_sector ||
+        base_sector + partition_start > (INT64_MAX - count) / 512) {
+        errno = EOVERFLOW;
         return -1;
     }
-
-    nd_driver_command  cmd {};
-    cmd.magic   = ND_DRIVER_MAGIC;
-    cmd.command = ND_DRIVER_CMD_READ;
-    cmd.length  = static_cast<uint32_t>(count);
-    cmd.sector  = sector;
-
-    int nd_fd = ::open("/dev/nd0", O_RDWR | O_CLOEXEC);
-    if (nd_fd < 0) {
+    const char *transport = std::getenv("ND_TRANSPORT_PATH");
+    int nd_fd = ::open(transport ? transport : "/dev/nd0",
+                       O_RDWR | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    if (nd_fd < 0)
         return -1;
-    }
-
-    ssize_t ret = ::write(nd_fd, &cmd, sizeof(cmd));
-    if (ret < 0) {
-        const int saved_errno = errno;
+    auto fail = [&](int error, size_t done) -> int64_t {
         ::close(nd_fd);
-        errno = saved_errno;
-        return -1;
+        errno = error;
+        return done ? static_cast<int64_t>(done) : -1;
+    };
+    if (::isatty(nd_fd)) {
+        struct termios settings {};
+        if (::tcgetattr(nd_fd, &settings) < 0)
+            return fail(errno, 0);
+        ::cfmakeraw(&settings);
+        settings.c_cflag |= CLOCAL | CREAD;
+        ::cfsetispeed(&settings, B115200);
+        ::cfsetospeed(&settings, B115200);
+        if (::tcsetattr(nd_fd, TCSANOW, &settings) < 0)
+            return fail(errno, 0);
+        ::tcflush(nd_fd, TCIOFLUSH);
     }
-
-    if (ret != sizeof(cmd)) {
-        ::close(nd_fd);
-        errno = EIO;
-        return -1;
+    auto transfer = [&](void *data, size_t bytes, bool writing) -> bool {
+        auto *cursor = static_cast<unsigned char *>(data);
+        while (bytes) {
+            struct pollfd event {nd_fd, static_cast<short>(writing ? POLLOUT : POLLIN), 0};
+            int ready;
+            do { ready = ::poll(&event, 1, 5000); } while (ready < 0 && errno == EINTR);
+            if (ready <= 0) {
+                if (!ready) errno = ETIMEDOUT;
+                return false;
+            }
+            if (!(event.revents & event.events)) {
+                errno = EIO;
+                return false;
+            }
+            ssize_t n = writing ? ::write(nd_fd, cursor, bytes) : ::read(nd_fd, cursor, bytes);
+            if (n < 0 && (errno == EINTR || errno == EAGAIN))
+                continue;
+            if (n <= 0) {
+                if (!n) errno = EIO;
+                return false;
+            }
+            cursor += n;
+            bytes -= static_cast<size_t>(n);
+        }
+        return true;
+    };
+    static_assert(sizeof(nd_driver_command) == 16, "host command ABI");
+    static_assert(sizeof(nd_response) == 16, "response ABI");
+    size_t copied = 0;
+    while (copied < count) {
+        const uint32_t chunk = static_cast<uint32_t>(std::min<size_t>(count - copied, ND_MAX_READ));
+        nd_driver_command command {};
+        command.magic = htole16(ND_DRIVER_MAGIC);
+        command.command = htole16(ND_DRIVER_CMD_READ);
+        command.length = htole32(chunk);
+        command.sector = htole64(base_sector + partition_start + copied / 512);
+        if (!transfer(&command, sizeof(command), true))
+            return fail(errno, copied);
+        nd_response response {};
+        if (!transfer(&response, sizeof(response), false))
+            return fail(errno, copied);
+        const int32_t status = static_cast<int32_t>(le32toh(response.status));
+        const uint32_t length = le32toh(response.length);
+        if (le16toh(response.magic) != ND_PROTOCOL_MAGIC ||
+            le16toh(response.version) != ND_RESPONSE_VERSION || response.reserved ||
+            status > 0 || status < -4095 || length > chunk || (status && length))
+            return fail(EPROTO, copied);
+        if (status)
+            return fail(-status, copied);
+        if (!transfer(static_cast<unsigned char *>(buffer) + copied, length, false))
+            return fail(errno, copied);
+        copied += length;
+        if (length < chunk)
+            break;
     }
-
     ::close(nd_fd);
-
-    /*
-     * 第一階段不會把資料寫進 buffer。
-     * 成功只代表請求已送到 Luckfox。
-     */
-    return static_cast<int64_t>(count);
+    return static_cast<int64_t>(copied);
 }
 
 extern "C" int nd_close(nd_file *file)

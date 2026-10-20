@@ -6,6 +6,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/workqueue.h>
 #include <linux/usb/composite.h>
 
 #include "u_f.h"
@@ -14,6 +16,10 @@
 struct f_nd {
     struct usb_function function;
     struct usb_ep *out_ep;
+    struct usb_ep *in_ep;
+    struct work_struct read_work;
+    struct usb_request *pending_out;
+    bool enabled;
 };
 
 static inline struct f_nd *func_to_nd(struct usb_function *f)
@@ -29,7 +35,7 @@ static struct usb_interface_descriptor nd_intf_desc = {
     .bLength            = USB_DT_INTERFACE_SIZE,
     .bDescriptorType    = USB_DT_INTERFACE,
     .bAlternateSetting  = 0,
-    .bNumEndpoints      = 1,
+    .bNumEndpoints      = 2,
     .bInterfaceClass    = USB_CLASS_VENDOR_SPEC,
     .bInterfaceSubClass = 0,
     .bInterfaceProtocol = 0,
@@ -45,9 +51,18 @@ static struct usb_endpoint_descriptor nd_fs_out_desc = {
     .bmAttributes     = USB_ENDPOINT_XFER_BULK,
 };
 
+static struct usb_endpoint_descriptor nd_fs_in_desc = {
+    .bLength = USB_DT_ENDPOINT_SIZE,
+    .bDescriptorType = USB_DT_ENDPOINT,
+    .bEndpointAddress = USB_DIR_IN,
+    .bmAttributes = USB_ENDPOINT_XFER_BULK,
+    .wMaxPacketSize = cpu_to_le16(64),
+};
+
 static struct usb_descriptor_header *nd_fs_descs[] = {
     (struct usb_descriptor_header *)&nd_intf_desc,
     (struct usb_descriptor_header *)&nd_fs_out_desc,
+    (struct usb_descriptor_header *)&nd_fs_in_desc,
     NULL,
 };
 
@@ -62,9 +77,18 @@ static struct usb_endpoint_descriptor nd_hs_out_desc = {
     .wMaxPacketSize   = cpu_to_le16(512),
 };
 
+static struct usb_endpoint_descriptor nd_hs_in_desc = {
+    .bLength = USB_DT_ENDPOINT_SIZE,
+    .bDescriptorType = USB_DT_ENDPOINT,
+    .bEndpointAddress = USB_DIR_IN,
+    .bmAttributes = USB_ENDPOINT_XFER_BULK,
+    .wMaxPacketSize = cpu_to_le16(512),
+};
+
 static struct usb_descriptor_header *nd_hs_descs[] = {
     (struct usb_descriptor_header *)&nd_intf_desc,
     (struct usb_descriptor_header *)&nd_hs_out_desc,
+    (struct usb_descriptor_header *)&nd_hs_in_desc,
     NULL,
 };
 
@@ -72,81 +96,100 @@ static struct usb_descriptor_header *nd_hs_descs[] = {
 /* -------------------------------------------------------------------------- */
 /* Receive command                                                            */
 
-static void nd_out_complete(struct usb_ep *ep,
-                            struct usb_request *req)
+/* One request in flight: OUT -> worker SD read -> IN -> requeue OUT.
+ * Filesystem/block reads run in process context, never USB completion context.
+ */
+static void nd_requeue_out(struct f_nd *nd, struct usb_request *out)
+{
+    if (!READ_ONCE(nd->enabled) ||
+        usb_ep_queue(nd->out_ep, out, GFP_ATOMIC))
+        free_ep_req(nd->out_ep, out);
+}
+
+static void nd_in_complete(struct usb_ep *ep, struct usb_request *req)
 {
     struct f_nd *nd = ep->driver_data;
+    struct usb_request *out = req->context;
+    int status = req->status;
+
+    free_ep_req(ep, req);
+    if (!status)
+        nd_requeue_out(nd, out);
+    else
+        free_ep_req(nd->out_ep, out);
+}
+
+static void nd_read_work(struct work_struct *work)
+{
+    struct f_nd *nd = container_of(work, struct f_nd, read_work);
+    struct usb_request *out = nd->pending_out;
+    struct usb_request *in;
     struct nd_command cmd;
-    int ret;
+    struct nd_response *response;
+    struct file *sd;
+    loff_t offset;
+    u64 sector;
+    u32 length;
+    ssize_t result = -EPROTO;
 
-    if (!nd)
+    in = alloc_ep_req(nd->in_ep, sizeof(*response) + ND_MAX_READ);
+    if (!in) {
+        nd_requeue_out(nd, out);
         return;
+    }
+    response = in->buf;
+    memset(response, 0, sizeof(*response));
+    if (out->actual != sizeof(cmd))
+        goto respond;
+    memcpy(&cmd, out->buf, sizeof(cmd));
+    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC)
+        goto respond;
+    if (le16_to_cpu(cmd.opcode) != ND_CMD_READ) {
+        result = -EOPNOTSUPP;
+        goto respond;
+    }
+    sector = le64_to_cpu(cmd.sector);
+    length = le32_to_cpu(cmd.length);
+    if (!length || length > ND_MAX_READ ||
+        sector > ((u64)S64_MAX - length) / 512) {
+        result = -EINVAL;
+        goto respond;
+    }
+    offset = sector * 512;
+    sd = filp_open("/dev/mmcblk1", O_RDONLY | O_LARGEFILE, 0);
+    if (IS_ERR(sd)) {
+        result = PTR_ERR(sd);
+        goto respond;
+    }
+    result = kernel_read(sd, (u8 *)in->buf + sizeof(*response), length, &offset);
+    filp_close(sd, NULL);
+    pr_info("nd: READ sector=%llu length=%u result=%zd\n",
+            (unsigned long long)sector, length, result);
+respond:
+    response->magic = cpu_to_le16(ND_PROTOCOL_MAGIC);
+    response->version = cpu_to_le16(ND_RESPONSE_VERSION);
+    response->status = cpu_to_le32(result < 0 ? (s32)result : 0);
+    response->length = cpu_to_le32(result > 0 ? result : 0);
+    in->length = sizeof(*response) + (result > 0 ? result : 0);
+    in->zero = 1;
+    in->complete = nd_in_complete;
+    in->context = out;
+    if (!READ_ONCE(nd->enabled) || usb_ep_queue(nd->in_ep, in, GFP_KERNEL)) {
+        free_ep_req(nd->in_ep, in);
+        nd_requeue_out(nd, out);
+    }
+}
 
-    switch (req->status) {
-    case 0:
-        break;
+static void nd_out_complete(struct usb_ep *ep, struct usb_request *req)
+{
+    struct f_nd *nd = ep->driver_data;
 
-    case -ECONNABORTED:
-    case -ECONNRESET:
-    case -ESHUTDOWN:
+    if (req->status || !READ_ONCE(nd->enabled)) {
         free_ep_req(ep, req);
         return;
-
-    default:
-        pr_err("nd: OUT request failed: %d\n",
-            req->status);
-        goto requeue;
     }
-
-    if (req->actual != sizeof(cmd)) {
-        pr_err("nd: invalid command size: %u\n",
-            req->actual);
-        goto requeue;
-    }
-
-    memcpy(&cmd, req->buf, sizeof(cmd));
-
-    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC) {
-        pr_err("nd: invalid magic: 0x%04x\n",
-            le16_to_cpu(cmd.magic));
-        goto requeue;
-    }
-
-    switch (le16_to_cpu(cmd.opcode)) {
-    case ND_CMD_READ:
-        pr_info("nd: READ sector=%llu length=%u\n",
-                (unsigned long long)
-                    le64_to_cpu(cmd.sector),
-                le32_to_cpu(cmd.length));
-
-        /*
-        * Phase 2:
-        *
-        * Read:
-        *     /dev/mmcblk1
-        *
-        * starting from:
-        *     sector
-        *
-        * for:
-        *     length bytes
-        *
-        * For now we only verify that the USB command
-        * reached the Luckfox kernel.
-        */
-        break;
-
-    default:
-        pr_err("nd: unknown opcode: %u\n",
-            le16_to_cpu(cmd.opcode));
-        break;
-    }
-
-requeue:
-    ret = usb_ep_queue(ep, req, GFP_ATOMIC);
-    if (ret)
-        pr_err("nd: failed to requeue OUT request: %d\n",
-            ret);
+    nd->pending_out = req;
+    schedule_work(&nd->read_work);
 }
 
 
@@ -207,6 +250,10 @@ static int nd_bind(struct usb_configuration *c,
     */
     nd_hs_out_desc.bEndpointAddress =
         nd_fs_out_desc.bEndpointAddress;
+    nd->in_ep = usb_ep_autoconfig(cdev->gadget, &nd_fs_in_desc);
+    if (!nd->in_ep)
+        return -ENODEV;
+    nd_hs_in_desc.bEndpointAddress = nd_fs_in_desc.bEndpointAddress;
 
     ret = usb_assign_descriptors(
         f,
@@ -235,8 +282,13 @@ static int nd_set_alt(struct usb_function *f,
 
     if (alt != 0)
         return -EINVAL;
+    /* A reset during a block read is retried after that worker finishes. */
+    if (work_busy(&nd->read_work))
+        return -EBUSY;
+    WRITE_ONCE(nd->enabled, false);
 
     usb_ep_disable(nd->out_ep);
+    usb_ep_disable(nd->in_ep);
 
     ret = config_ep_by_speed(cdev->gadget,
                             f,
@@ -248,18 +300,30 @@ static int nd_set_alt(struct usb_function *f,
     if (ret)
         return ret;
 
+    ret = config_ep_by_speed(cdev->gadget, f, nd->in_ep);
+    if (ret)
+        goto disable_out;
+    ret = usb_ep_enable(nd->in_ep);
+    if (ret)
+        goto disable_out;
+    nd->in_ep->driver_data = nd;
     nd->out_ep->driver_data = nd;
+    WRITE_ONCE(nd->enabled, true);
 
     ret = nd_start_out(nd);
     if (ret) {
-        nd->out_ep->driver_data = NULL;
+        WRITE_ONCE(nd->enabled, false);
+        usb_ep_disable(nd->in_ep);
         usb_ep_disable(nd->out_ep);
         return ret;
     }
 
-    pr_info("nd: OUT endpoint enabled\n");
+    pr_info("nd: OUT and IN endpoints enabled (response v1)\n");
 
     return 0;
+disable_out:
+    usb_ep_disable(nd->out_ep);
+    return ret;
 }
 
 
@@ -270,8 +334,10 @@ static void nd_disable(struct usb_function *f)
     if (!nd->out_ep)
         return;
 
+    WRITE_ONCE(nd->enabled, false);
     usb_ep_disable(nd->out_ep);
-    nd->out_ep->driver_data = NULL;
+    usb_ep_disable(nd->in_ep);
+    /* driver_data lives until free_func; workers can still finish after reset. */
 
     pr_info("nd: gadget function disabled\n");
 }
@@ -281,6 +347,7 @@ static void nd_free_func(struct usb_function *f)
 {
     struct f_nd *nd = func_to_nd(f);
 
+    cancel_work_sync(&nd->read_work);
     usb_free_all_descriptors(f);
     kfree(nd);
 }
@@ -363,6 +430,7 @@ nd_alloc_func(struct usb_function_instance *fi)
     if (!nd)
         return ERR_PTR(-ENOMEM);
 
+    INIT_WORK(&nd->read_work, nd_read_work);
     nd->function.name     = "nd";
     nd->function.bind     = nd_bind;
     nd->function.set_alt  = nd_set_alt;

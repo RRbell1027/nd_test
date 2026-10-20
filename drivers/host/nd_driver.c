@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/poll.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
 
 #include "nd_driver.h"
 #include "nd_protocol.h"
@@ -21,6 +22,10 @@ struct nd_dev {
     struct usb_interface *interface;
 
     unsigned char bulk_out_ep;
+    unsigned char bulk_in_ep;
+    u8 response[sizeof(struct nd_response) + ND_MAX_READ];
+    size_t response_size;
+    size_t response_offset;
 
     /*
      * /dev/nd0 is a byte-stream interface.
@@ -31,7 +36,6 @@ struct nd_dev {
     u8 cmd_buf[sizeof(struct nd_driver_command)];
     size_t cmd_received;
 
-    struct mutex cmd_lock;
 };
 
 /*
@@ -41,6 +45,9 @@ struct nd_dev {
  * 就不能再使用這個 global pointer。
  */
 static struct nd_dev *nd;
+/* Protect global lifetime as well as command/response state during disconnect. */
+static DEFINE_MUTEX(nd_lock);
+static DECLARE_WAIT_QUEUE_HEAD(nd_read_wait);
 
 
 /* -------------------------------------------------------------------------- */
@@ -52,10 +59,16 @@ static int nd_handle_command(const struct nd_driver_command *cmd)
     struct nd_command usb_cmd;
     int actual_length;
     int ret;
+    struct nd_response *response;
+    u32 payload;
 
     if (!nd || !nd->udev)
         return -ENODEV;
 
+    if (!nd->bulk_in_ep)
+        return -EOPNOTSUPP;
+    if (!cmd->length || cmd->length > ND_MAX_READ)
+        return -EINVAL;
     if (cmd->magic != ND_DRIVER_MAGIC) {
         pr_err("nd: invalid command magic: 0x%04x\n",
                cmd->magic);
@@ -102,9 +115,25 @@ static int nd_handle_command(const struct nd_driver_command *cmd)
         return -EIO;
     }
 
-    pr_info("nd: sent USB command: %d bytes\n",
-            actual_length);
-
+    ret = usb_bulk_msg(nd->udev,
+        usb_rcvbulkpipe(nd->udev, nd->bulk_in_ep),
+        nd->response, sizeof(nd->response), &actual_length, 5000);
+    if (ret)
+        return ret;
+    if (actual_length < sizeof(*response))
+        return -EPROTO;
+    response = (struct nd_response *)nd->response;
+    payload = le32_to_cpu(response->length);
+    if (le16_to_cpu(response->magic) != ND_PROTOCOL_MAGIC ||
+        le16_to_cpu(response->version) != ND_RESPONSE_VERSION ||
+        response->reserved || payload > cmd->length ||
+        actual_length != sizeof(*response) + payload ||
+        (s32)le32_to_cpu(response->status) > 0 ||
+        (response->status && payload))
+        return -EPROTO;
+    nd->response_offset = 0;
+    nd->response_size = actual_length;
+    wake_up_interruptible(&nd_read_wait);
     return 0;
 }
 
@@ -117,10 +146,15 @@ static ssize_t nd_write(struct file *file,
     size_t consumed = 0;
     int ret = 0;
 
-    if (!nd || !nd->udev)
+    mutex_lock(&nd_lock);
+    if (!nd || !nd->udev) {
+        mutex_unlock(&nd_lock);
         return -ENODEV;
-
-    mutex_lock(&nd->cmd_lock);
+    }
+    if (nd->response_size != nd->response_offset) {
+        mutex_unlock(&nd_lock);
+        return -EBUSY;
+    }
 
     while (consumed < count) {
         size_t remaining;
@@ -162,41 +196,60 @@ static ssize_t nd_write(struct file *file,
 
             if (ret)
                 goto out;
+            if (consumed < count) {
+                ret = -EBUSY;
+                goto out;
+            }
         }
     }
 
 out:
-    mutex_unlock(&nd->cmd_lock);
+    mutex_unlock(&nd_lock);
 
-    /*
-    * If some bytes were successfully consumed, report them
-    * to the caller even if processing later failed.
-    */
-    if (consumed)
-        return consumed;
-
-    return ret;
+    /* Processing errors must reach the caller, even after command assembly. */
+    return ret ? ret : consumed;
 }
 
-static ssize_t nd_read(struct file *file,
-    char __user *buf,
-    size_t count,
-    loff_t *ppos)
+static ssize_t nd_read(struct file *file, char __user *buf,
+                       size_t count, loff_t *ppos)
 {
-    /*
-    * 暫時沒有任何 RX data。
-    * QEMU 用 O_NONBLOCK 開啟 /dev/nd0，
-    * 因此目前直接表示沒有資料可讀。
-    */
-    return -EAGAIN;
+    ssize_t result;
+    if (!count)
+        return 0;
+    mutex_lock(&nd_lock);
+    if (!nd) {
+        result = -ENODEV;
+        goto out;
+    }
+    count = min(count, nd->response_size - nd->response_offset);
+    if (!count) {
+        result = -EAGAIN;
+        goto out;
+    }
+    if (copy_to_user(buf, nd->response + nd->response_offset, count)) {
+        result = -EFAULT;
+        goto out;
+    }
+    nd->response_offset += count;
+    result = count;
+out:
+    mutex_unlock(&nd_lock);
+    return result;
 }
 
 static __poll_t nd_poll(struct file *file, poll_table *wait)
 {
-    /*
-    * 暫時沒有 RX buffer，因此永遠沒有 POLLIN。
-    */
-    return 0;
+    __poll_t mask;
+    poll_wait(file, &nd_read_wait, wait);
+    mutex_lock(&nd_lock);
+    if (!nd)
+        mask = EPOLLERR | EPOLLHUP;
+    else if (nd->response_size > nd->response_offset)
+        mask = EPOLLIN | EPOLLRDNORM;
+    else
+        mask = EPOLLOUT | EPOLLWRNORM;
+    mutex_unlock(&nd_lock);
+    return mask;
 }
 
 static const struct file_operations nd_fops = {
@@ -232,11 +285,14 @@ static int nd_probe(struct usb_interface *interface,
     int i;
     int ret;
 
+    mutex_lock(&nd_lock);
     pr_info("nd: f_nd interface detected\n");
 
     dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-    if (!dev)
+    if (!dev) {
+        mutex_unlock(&nd_lock);
         return -ENOMEM;
+    }
 
     /*
      * Keep a reference to the underlying USB device.
@@ -253,10 +309,8 @@ static int nd_probe(struct usb_interface *interface,
     /*
      * Search for f_nd Bulk OUT endpoint.
      *
-     * 目前 f_nd descriptor:
-     *
-     *     bNumEndpoints = 1
-     *     endpoint       = Bulk OUT
+     * Accept legacy OUT-only firmware for enumeration; READ requires IN.
+     * Response-v1 firmware provides Bulk OUT and Bulk IN.
      */
     for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
 
@@ -267,6 +321,8 @@ static int nd_probe(struct usb_interface *interface,
                 endpoint->bEndpointAddress,
                 endpoint->bmAttributes);
 
+        if (usb_endpoint_is_bulk_in(endpoint))
+            dev->bulk_in_ep = endpoint->bEndpointAddress;
         if (usb_endpoint_is_bulk_out(endpoint)) {
 
             dev->bulk_out_ep =
@@ -335,7 +391,7 @@ static int nd_probe(struct usb_interface *interface,
     nd = dev;
 
     pr_info("nd: registered /dev/nd0\n");
-
+    mutex_unlock(&nd_lock);
     return 0;
 
 
@@ -343,7 +399,7 @@ error:
 
     usb_put_dev(dev->udev);
     kfree(dev);
-
+    mutex_unlock(&nd_lock);
     return ret;
 }
 
@@ -356,6 +412,7 @@ static void nd_disconnect(struct usb_interface *interface)
 {
     struct nd_dev *dev;
 
+    mutex_lock(&nd_lock);
     dev = usb_get_intfdata(interface);
 
     usb_set_intfdata(interface, NULL);
@@ -380,6 +437,8 @@ static void nd_disconnect(struct usb_interface *interface)
         kfree(dev);
     }
 
+    mutex_unlock(&nd_lock);
+    wake_up_interruptible(&nd_read_wait);
     pr_info("nd: f_nd interface disconnected\n");
 }
 
@@ -388,27 +447,14 @@ static void nd_disconnect(struct usb_interface *interface)
 /* USB device matching                                                        */
 /* -------------------------------------------------------------------------- */
 
-/*
- * 目前 Luckfox f_nd descriptor:
- *
- *     bInterfaceClass    = USB_CLASS_VENDOR_SPEC (0xff)
- *     bInterfaceSubClass = 0
- *     bInterfaceProtocol = 0
- *
- * 因此第一版直接用 interface descriptor match。
- *
- * 注意：
- * 如果未來 composite gadget 裡還有其他
- * class=0xff/subclass=0/protocol=0 的 interface，
- * 這個 match 就太寬了。
- *
- * 之後建議把 f_nd 改成 ND 專屬 subclass/protocol。
+/* Match only the Luckfox composite ND interface. Class-only matching also
+ * claimed the PL2303 UART adapter after WSL reboot, breaking management I/O.
  */
 static const struct usb_device_id nd_usb_ids[] = {
 
     {
-        USB_INTERFACE_INFO(
-            USB_CLASS_VENDOR_SPEC,
+        USB_DEVICE_AND_INTERFACE_INFO(
+            0x2207, 0x0000, USB_CLASS_VENDOR_SPEC,
             0,
             0
         )
