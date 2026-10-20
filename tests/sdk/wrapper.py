@@ -25,4 +25,6 @@ with tempfile.TemporaryDirectory(prefix='nds sdk ') as temp:
  assert '-lnd' not in run('@'+str(response))
  shown=subprocess.check_output([str(wrapper),'--show','main.cpp'],text=True)
  assert str(fake) in shown and '-lnd' in shown
+ (prefix/'share/nds-sdk/wrapper.json').write_text(json.dumps({'compiler':str(fake),'prefix':'/usr/local'}))
+ moved=run('main.cpp');assert '-I/usr/local/include' in moved and '-L/usr/local/lib' in moved
  print('PASS: wrapper preserves user arguments; no implicit offload/CPU; compile-only and response-file phases omit link libraries')

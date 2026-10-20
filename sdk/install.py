@@ -11,8 +11,11 @@ p=argparse.ArgumentParser(description=__doc__)
 root=Path(__file__).resolve().parent.parent
 p.add_argument('--prefix',type=Path,default=Path('/usr/local'))
 p.add_argument('--build',type=Path,default=root/'build')
+p.add_argument('--compiler',type=Path,help='Existing standalone clang++ path')
+p.add_argument('--wrapper-home',type=Path,help='SDK home for wrapper/config; libraries still use prefix')
 a=p.parse_args();prefix=a.prefix.resolve();build=a.build.resolve()
-compiler=build/'llvm/bin/clang++'
+compiler=a.compiler.absolute() if a.compiler else build/'llvm/bin/clang++'
+wrapper_home=a.wrapper_home.resolve() if a.wrapper_home else prefix
 required=[compiler,build/'runtime/libnd.so',build/'runtime/libnd_runtime.so',build/'openmp/runtime/src/libomp.so',build/'offload-native/libomptarget.so']
 for path in required:
  if not path.is_file():p.error(f'missing build product: {path}; build nds-runtime first')
@@ -26,9 +29,17 @@ for folder,names in [('lib',['libnd.so','libnd.a','libnd_runtime.so','libnd_runt
 for directory,extra in [('runtime',[]),('openmp',[]),('offload-native',['--component','omptarget'])]:
  subprocess.run(['cmake','--install',str(build/directory),'--prefix',str(prefix),*extra],check=True)
 (prefix/'bin').mkdir(parents=True,exist_ok=True)
-wrapper=prefix/'bin/nds-clang++';shutil.copyfile(root/'sdk/nds-clang++',wrapper);wrapper.chmod(0o755)
-config=prefix/'share/nds-sdk/wrapper.json';config.parent.mkdir(parents=True,exist_ok=True)
-config.write_text(json.dumps({'compiler':str(compiler),'prefix':str(prefix)},indent=2)+'\n')
+(wrapper_home/'bin').mkdir(parents=True,exist_ok=True)
+wrapper=wrapper_home/'bin/nds-clang++'
+shutil.copyfile(root/'sdk/nds-clang++',wrapper);wrapper.chmod(0o755)
+entry=prefix/'bin/nds-clang++'
+if entry!=wrapper:
+ if entry.exists() or entry.is_symlink():entry.unlink()
+ entry.symlink_to(wrapper)
+contents=json.dumps({'compiler':str(compiler),'prefix':str(prefix)},indent=2)+'\n'
+for home in {prefix,wrapper_home}:
+ config=home/'share/nds-sdk/wrapper.json';config.parent.mkdir(parents=True,exist_ok=True)
+ config.write_text(contents)
 # /usr/local/lib is already in Ubuntu's loader configuration. Other prefixes
 # use wrapper-provided RUNPATH and may use LD_LIBRARY_PATH for indirect deps.
 if prefix==Path('/usr/local'):

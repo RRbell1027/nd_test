@@ -16,6 +16,7 @@ def main():
  config=prefix/'share/nds-sdk/wrapper.json'
  try:cfg=json.loads(config.read_text())
  except (OSError,ValueError) as e:sys.exit(f'nds-clang++: cannot read {config}: {e}')
+ prefix=Path(cfg.get('prefix',str(prefix)))
  # Expand response files for phase detection only; clang receives originals.
  def expanded(items,depth=0):
   if depth>16:raise ValueError('response files nested too deeply')
