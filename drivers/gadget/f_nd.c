@@ -8,6 +8,13 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/workqueue.h>
+#include <linux/miscdevice.h>
+#include <linux/kfifo.h>
+#include <linux/kref.h>
+#include <linux/poll.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
 #include <linux/usb/composite.h>
 
 #include "u_f.h"
@@ -20,6 +27,14 @@ struct f_nd {
     struct work_struct read_work;
     struct usb_request *pending_out;
     bool enabled;
+    bool dying;
+    struct miscdevice rpc_misc;
+    struct kfifo rx_fifo, tx_fifo;
+    spinlock_t fifo_lock;
+    wait_queue_head_t stream_wait;
+    atomic_t opened;
+    unsigned int generation;
+    struct kref refs;
 };
 
 static inline struct f_nd *func_to_nd(struct usb_function *f)
@@ -27,6 +42,139 @@ static inline struct f_nd *func_to_nd(struct usb_function *f)
     return container_of(f, struct f_nd, function);
 }
 
+
+/* USB workers produce RX bytes and consume TX bytes; one userspace executor
+ * owns /dev/nd_rpc. A session reset invalidates its fd so the supervisor can
+ * restart it and discard image/region state from an interrupted client.
+ */
+struct nd_stream_file {
+    struct f_nd *nd;
+    unsigned int generation;
+};
+static void nd_destroy(struct kref *ref)
+{
+    struct f_nd *nd = container_of(ref, struct f_nd, refs);
+    kfifo_free(&nd->rx_fifo);
+    kfifo_free(&nd->tx_fifo);
+    kfree(nd);
+}
+static void nd_stream_reset(struct f_nd *nd)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&nd->fifo_lock, flags);
+    ++nd->generation;
+    kfifo_reset(&nd->rx_fifo);
+    kfifo_reset(&nd->tx_fifo);
+    spin_unlock_irqrestore(&nd->fifo_lock, flags);
+    wake_up_interruptible(&nd->stream_wait);
+}
+static bool nd_stale(struct nd_stream_file *ctx)
+{
+    return READ_ONCE(ctx->nd->dying) ||
+           ctx->generation != READ_ONCE(ctx->nd->generation);
+}
+static int nd_stream_open(struct inode *inode, struct file *file)
+{
+    struct miscdevice *misc = file->private_data;
+    struct f_nd *nd = container_of(misc, struct f_nd, rpc_misc);
+    struct nd_stream_file *ctx;
+    if (READ_ONCE(nd->dying))
+        return -ENODEV;
+    if (atomic_cmpxchg(&nd->opened, 0, 1))
+        return -EBUSY;
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx) { atomic_set(&nd->opened, 0); return -ENOMEM; }
+    kref_get(&nd->refs);
+    ctx->nd = nd;
+    ctx->generation = READ_ONCE(nd->generation);
+    file->private_data = ctx;
+    return nonseekable_open(inode, file);
+}
+static int nd_stream_release(struct inode *inode, struct file *file)
+{
+    struct nd_stream_file *ctx = file->private_data;
+    atomic_set(&ctx->nd->opened, 0);
+    wake_up_interruptible(&ctx->nd->stream_wait);
+    kref_put(&ctx->nd->refs, nd_destroy);
+    kfree(ctx);
+    return 0;
+}
+static ssize_t nd_stream_read(struct file *file, char __user *buf,
+                              size_t count, loff_t *pos)
+{
+    struct nd_stream_file *ctx = file->private_data;
+    struct f_nd *nd = ctx->nd;
+    unsigned long flags;
+    unsigned int n;
+    u8 *tmp;
+    int ret;
+    if (!count) return 0;
+    count = min_t(size_t, count, ND_MAX_READ);
+    for (;;) {
+        if (nd_stale(ctx)) return -EPIPE;
+        if (READ_ONCE(nd->enabled) && !kfifo_is_empty(&nd->rx_fifo)) break;
+        if (file->f_flags & O_NONBLOCK) return -EAGAIN;
+        ret = wait_event_interruptible(nd->stream_wait,
+            nd_stale(ctx) || (READ_ONCE(nd->enabled) && !kfifo_is_empty(&nd->rx_fifo)));
+        if (ret) return ret;
+    }
+    tmp = kmalloc(count, GFP_KERNEL);
+    if (!tmp) return -ENOMEM;
+    spin_lock_irqsave(&nd->fifo_lock, flags);
+    n = nd_stale(ctx) ? 0 : kfifo_out(&nd->rx_fifo, tmp, count);
+    spin_unlock_irqrestore(&nd->fifo_lock, flags);
+    ret = n ? (copy_to_user(buf, tmp, n) ? -EFAULT : n) : -EPIPE;
+    kfree(tmp);
+    wake_up_interruptible(&nd->stream_wait);
+    return ret;
+}
+static ssize_t nd_stream_write(struct file *file, const char __user *buf,
+                               size_t count, loff_t *pos)
+{
+    struct nd_stream_file *ctx = file->private_data;
+    struct f_nd *nd = ctx->nd;
+    unsigned long flags;
+    unsigned int n;
+    u8 *tmp;
+    int ret;
+    if (!count) return 0;
+    count = min_t(size_t, count, ND_MAX_READ);
+    tmp = memdup_user(buf, count);
+    if (IS_ERR(tmp)) return PTR_ERR(tmp);
+    for (;;) {
+        if (nd_stale(ctx)) { ret = -EPIPE; goto out; }
+        if (READ_ONCE(nd->enabled) && kfifo_avail(&nd->tx_fifo)) break;
+        if (file->f_flags & O_NONBLOCK) { ret = -EAGAIN; goto out; }
+        ret = wait_event_interruptible(nd->stream_wait,
+            nd_stale(ctx) || (READ_ONCE(nd->enabled) && kfifo_avail(&nd->tx_fifo)));
+        if (ret) goto out;
+    }
+    spin_lock_irqsave(&nd->fifo_lock, flags);
+    n = nd_stale(ctx) ? 0 : kfifo_in(&nd->tx_fifo, tmp, count);
+    spin_unlock_irqrestore(&nd->fifo_lock, flags);
+    ret = n ? n : -EPIPE;
+out:
+    kfree(tmp);
+    wake_up_interruptible(&nd->stream_wait);
+    return ret;
+}
+static __poll_t nd_stream_poll(struct file *file, poll_table *wait)
+{
+    struct nd_stream_file *ctx = file->private_data;
+    struct f_nd *nd = ctx->nd;
+    __poll_t mask = 0;
+    poll_wait(file, &nd->stream_wait, wait);
+    if (nd_stale(ctx)) return EPOLLERR | EPOLLHUP;
+    if (!READ_ONCE(nd->enabled)) return 0;
+    if (!kfifo_is_empty(&nd->rx_fifo)) mask |= EPOLLIN | EPOLLRDNORM;
+    if (kfifo_avail(&nd->tx_fifo)) mask |= EPOLLOUT | EPOLLWRNORM;
+    return mask;
+}
+static const struct file_operations nd_stream_fops = {
+    .owner = THIS_MODULE, .open = nd_stream_open, .release = nd_stream_release,
+    .read = nd_stream_read, .write = nd_stream_write, .poll = nd_stream_poll,
+    .llseek = no_llseek,
+};
 
 /* -------------------------------------------------------------------------- */
 /* USB descriptors                                                            */
@@ -105,25 +253,51 @@ static void nd_requeue_out(struct f_nd *nd, struct usb_request *out)
         usb_ep_queue(nd->out_ep, out, GFP_ATOMIC))
         free_ep_req(nd->out_ep, out);
 }
-
 static void nd_in_complete(struct usb_ep *ep, struct usb_request *req)
 {
     struct f_nd *nd = ep->driver_data;
     struct usb_request *out = req->context;
     int status = req->status;
-
     free_ep_req(ep, req);
-    if (!status)
-        nd_requeue_out(nd, out);
-    else
-        free_ep_req(nd->out_ep, out);
+    if (!status) nd_requeue_out(nd, out);
+    else free_ep_req(nd->out_ep, out);
 }
-
+static ssize_t nd_rpc_push(struct f_nd *nd, const void *data, u32 length)
+{
+    unsigned long flags;
+    unsigned int n;
+    long ret;
+    ret = wait_event_interruptible_timeout(nd->stream_wait,
+        !READ_ONCE(nd->enabled) || READ_ONCE(nd->dying) ||
+        kfifo_avail(&nd->rx_fifo) >= length, msecs_to_jiffies(20000));
+    if (ret < 0) return ret;
+    if (!ret) return -ETIMEDOUT;
+    spin_lock_irqsave(&nd->fifo_lock, flags);
+    n = nd->enabled && !nd->dying ? kfifo_in(&nd->rx_fifo, data, length) : 0;
+    spin_unlock_irqrestore(&nd->fifo_lock, flags);
+    wake_up_interruptible(&nd->stream_wait);
+    return n == length ? 0 : -ESHUTDOWN;
+}
+static ssize_t nd_rpc_pull(struct f_nd *nd, void *data, u32 length)
+{
+    unsigned long flags;
+    unsigned int n;
+    long ret;
+    ret = wait_event_interruptible_timeout(nd->stream_wait,
+        !READ_ONCE(nd->enabled) || READ_ONCE(nd->dying) ||
+        !kfifo_is_empty(&nd->tx_fifo), msecs_to_jiffies(20000));
+    if (ret < 0) return ret;
+    if (!ret) return -ETIMEDOUT;
+    spin_lock_irqsave(&nd->fifo_lock, flags);
+    n = nd->enabled && !nd->dying ? kfifo_out(&nd->tx_fifo, data, length) : 0;
+    spin_unlock_irqrestore(&nd->fifo_lock, flags);
+    wake_up_interruptible(&nd->stream_wait);
+    return n ? n : -ESHUTDOWN;
+}
 static void nd_read_work(struct work_struct *work)
 {
     struct f_nd *nd = container_of(work, struct f_nd, read_work);
-    struct usb_request *out = nd->pending_out;
-    struct usb_request *in;
+    struct usb_request *out = nd->pending_out, *in;
     struct nd_command cmd;
     struct nd_response *response;
     struct file *sd;
@@ -131,40 +305,49 @@ static void nd_read_work(struct work_struct *work)
     u64 sector;
     u32 length;
     ssize_t result = -EPROTO;
-
+    nd->pending_out = NULL;
     in = alloc_ep_req(nd->in_ep, sizeof(*response) + ND_MAX_READ);
-    if (!in) {
-        nd_requeue_out(nd, out);
-        return;
-    }
+    if (!in) { nd_requeue_out(nd, out); return; }
     response = in->buf;
     memset(response, 0, sizeof(*response));
-    if (out->actual != sizeof(cmd))
-        goto respond;
+    if (out->actual < sizeof(cmd)) goto respond;
     memcpy(&cmd, out->buf, sizeof(cmd));
-    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC)
-        goto respond;
-    if (le16_to_cpu(cmd.opcode) != ND_CMD_READ) {
-        result = -EOPNOTSUPP;
-        goto respond;
-    }
-    sector = le64_to_cpu(cmd.sector);
+    if (le16_to_cpu(cmd.magic) != ND_PROTOCOL_MAGIC) goto respond;
     length = le32_to_cpu(cmd.length);
-    if (!length || length > ND_MAX_READ ||
-        sector > ((u64)S64_MAX - length) / 512) {
-        result = -EINVAL;
-        goto respond;
+    switch (le16_to_cpu(cmd.opcode)) {
+    case ND_CMD_RPC_RESET:
+        if (out->actual != sizeof(cmd) || length) goto respond;
+        nd_stream_reset(nd);
+        result = 0;
+        break;
+    case ND_CMD_RPC_OUT:
+        if (!length || length > ND_MAX_READ || out->actual != sizeof(cmd) + ND_MAX_READ)
+            goto respond;
+        result = nd_rpc_push(nd, (u8 *)out->buf + sizeof(cmd), length);
+        break;
+    case ND_CMD_RPC_IN:
+        if (!length || length > ND_MAX_READ || out->actual != sizeof(cmd))
+            goto respond;
+        result = nd_rpc_pull(nd, (u8 *)in->buf + sizeof(*response), length);
+        break;
+    case ND_CMD_READ:
+        sector = le64_to_cpu(cmd.sector);
+        if (out->actual != sizeof(cmd) || !length || length > ND_MAX_READ ||
+            sector > ((u64)S64_MAX - length) / 512) {
+            result = -EINVAL;
+            break;
+        }
+        offset = sector * 512;
+        sd = filp_open("/dev/mmcblk1", O_RDONLY | O_LARGEFILE, 0);
+        if (IS_ERR(sd)) { result = PTR_ERR(sd); break; }
+        result = kernel_read(sd, (u8 *)in->buf + sizeof(*response), length, &offset);
+        filp_close(sd, NULL);
+        pr_info("nd: READ sector=%llu length=%u result=%zd\n",
+                (unsigned long long)sector, length, result);
+        break;
+    default:
+        result = -EOPNOTSUPP;
     }
-    offset = sector * 512;
-    sd = filp_open("/dev/mmcblk1", O_RDONLY | O_LARGEFILE, 0);
-    if (IS_ERR(sd)) {
-        result = PTR_ERR(sd);
-        goto respond;
-    }
-    result = kernel_read(sd, (u8 *)in->buf + sizeof(*response), length, &offset);
-    filp_close(sd, NULL);
-    pr_info("nd: READ sector=%llu length=%u result=%zd\n",
-            (unsigned long long)sector, length, result);
 respond:
     response->magic = cpu_to_le16(ND_PROTOCOL_MAGIC);
     response->version = cpu_to_le16(ND_RESPONSE_VERSION);
@@ -179,19 +362,13 @@ respond:
         nd_requeue_out(nd, out);
     }
 }
-
 static void nd_out_complete(struct usb_ep *ep, struct usb_request *req)
 {
     struct f_nd *nd = ep->driver_data;
-
-    if (req->status || !READ_ONCE(nd->enabled)) {
-        free_ep_req(ep, req);
-        return;
-    }
+    if (req->status || !READ_ONCE(nd->enabled)) { free_ep_req(ep, req); return; }
     nd->pending_out = req;
     schedule_work(&nd->read_work);
 }
-
 
 /* -------------------------------------------------------------------------- */
 /* Endpoint                                                                   */
@@ -202,7 +379,7 @@ static int nd_start_out(struct f_nd *nd)
     int ret;
 
     req = alloc_ep_req(nd->out_ep,
-                    sizeof(struct nd_command));
+                    sizeof(struct nd_command) + ND_MAX_READ);
     if (!req)
         return -ENOMEM;
 
@@ -286,6 +463,7 @@ static int nd_set_alt(struct usb_function *f,
     if (work_busy(&nd->read_work))
         return -EBUSY;
     WRITE_ONCE(nd->enabled, false);
+    nd_stream_reset(nd);
 
     usb_ep_disable(nd->out_ep);
     usb_ep_disable(nd->in_ep);
@@ -309,6 +487,7 @@ static int nd_set_alt(struct usb_function *f,
     nd->in_ep->driver_data = nd;
     nd->out_ep->driver_data = nd;
     WRITE_ONCE(nd->enabled, true);
+    wake_up_interruptible(&nd->stream_wait);
 
     ret = nd_start_out(nd);
     if (ret) {
@@ -318,7 +497,7 @@ static int nd_set_alt(struct usb_function *f,
         return ret;
     }
 
-    pr_info("nd: OUT and IN endpoints enabled (response v1)\n");
+    pr_info("nd: OUT and IN endpoints enabled (READ + runtime stream)\n");
 
     return 0;
 disable_out:
@@ -335,6 +514,7 @@ static void nd_disable(struct usb_function *f)
         return;
 
     WRITE_ONCE(nd->enabled, false);
+    nd_stream_reset(nd);
     usb_ep_disable(nd->out_ep);
     usb_ep_disable(nd->in_ep);
     /* driver_data lives until free_func; workers can still finish after reset. */
@@ -347,9 +527,17 @@ static void nd_free_func(struct usb_function *f)
 {
     struct f_nd *nd = func_to_nd(f);
 
+    WRITE_ONCE(nd->dying, true);
+    WRITE_ONCE(nd->enabled, false);
+    nd_stream_reset(nd);
+    misc_deregister(&nd->rpc_misc);
     cancel_work_sync(&nd->read_work);
+    if (nd->pending_out) {
+        free_ep_req(nd->out_ep, nd->pending_out);
+        nd->pending_out = NULL;
+    }
     usb_free_all_descriptors(f);
-    kfree(nd);
+    kref_put(&nd->refs, nd_destroy);
 }
  
 
@@ -430,6 +618,29 @@ nd_alloc_func(struct usb_function_instance *fi)
     if (!nd)
         return ERR_PTR(-ENOMEM);
 
+    spin_lock_init(&nd->fifo_lock);
+    init_waitqueue_head(&nd->stream_wait);
+    atomic_set(&nd->opened, 0);
+    kref_init(&nd->refs);
+    if (kfifo_alloc(&nd->rx_fifo, 64 * 1024, GFP_KERNEL)) {
+        kfree(nd);
+        return ERR_PTR(-ENOMEM);
+    }
+    if (kfifo_alloc(&nd->tx_fifo, 64 * 1024, GFP_KERNEL)) {
+        kfifo_free(&nd->rx_fifo);
+        kfree(nd);
+        return ERR_PTR(-ENOMEM);
+    }
+    nd->rpc_misc.minor = MISC_DYNAMIC_MINOR;
+    nd->rpc_misc.name = "nd_rpc";
+    nd->rpc_misc.fops = &nd_stream_fops;
+    {
+        int ret = misc_register(&nd->rpc_misc);
+        if (ret) {
+            kref_put(&nd->refs, nd_destroy);
+            return ERR_PTR(ret);
+        }
+    }
     INIT_WORK(&nd->read_work, nd_read_work);
     nd->function.name     = "nd";
     nd->function.bind     = nd_bind;

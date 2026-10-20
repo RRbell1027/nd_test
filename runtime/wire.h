@@ -6,12 +6,13 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#define NDR_MAGIC 0x3152444eU
-#define NDR_HEADER 24
-#define NDR_MAX_BODY (16U * 1024U * 1024U)
+#include "nd_rpc_wire.h"
+#define NDR_MAGIC ND_RPC_MAGIC
+#define NDR_HEADER ND_RPC_HEADER_SIZE
+#define NDR_MAX_BODY ND_RPC_MAX_BODY
 #define NDR_MAX_ARGS 16
 #define NDR_SLOTS 64
-enum ndr_op { NDR_HELLO=1, NDR_LOAD, NDR_UNLOAD, NDR_ALLOC, NDR_FREE,
+enum ndr_op { NDR_HELLO=ND_RPC_HELLO, NDR_LOAD, NDR_UNLOAD, NDR_ALLOC, NDR_FREE,
               NDR_PUT, NDR_GET, NDR_SYMBOL, NDR_LAUNCH, NDR_SHUTDOWN };
 static inline uint32_t ndr_get32(const void *v) {
  const unsigned char *p=v;return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;

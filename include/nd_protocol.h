@@ -4,6 +4,7 @@
 #define ND_PROTOCOL_H
 
 #include <linux/types.h>
+#include "nd_rpc_wire.h"
 
 #define ND_PROTOCOL_MAGIC 0x4e44
 #define ND_RESPONSE_VERSION 1
@@ -11,6 +12,9 @@
 
 enum nd_opcode {
     ND_CMD_READ = 0x01,
+    ND_CMD_RPC_OUT = 0x02,
+    ND_CMD_RPC_IN = 0x03,
+    ND_CMD_RPC_RESET = 0x04,
 };
 
 struct nd_command {

@@ -37,7 +37,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 
-$(BUILD)/libnd.so: src/libnd.cpp include/nd.h include/nd_driver.h include/nd_protocol.h | $(BUILD)
+$(BUILD)/libnd.so: src/libnd.cpp include/nd.h include/nd_driver.h include/nd_protocol.h include/nd_rpc_wire.h | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -shared \
 		-o $@ src/libnd.cpp
 
@@ -49,8 +49,8 @@ $(BUILD)/test_nd: examples/test_nd.cpp include/nd.h $(BUILD)/libnd.so | $(BUILD)
 		-Wl,-rpath,'$$ORIGIN'
 
 
-$(BUILD)/nd_driver.ko: drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h | $(BUILD)
-	cp drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h $(BUILD)/
+$(BUILD)/nd_driver.ko: drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h include/nd_rpc_wire.h | $(BUILD)
+	cp drivers/host/nd_driver.c include/nd_driver.h include/nd_protocol.h include/nd_rpc_wire.h $(BUILD)/
 	printf 'obj-m += nd_driver.o\n' > $(BUILD)/Makefile
 	$(MAKE) -C $(KDIR) M=$(BUILD) modules
 ifeq ($(IS_WSL),1)
@@ -87,7 +87,7 @@ NDS_JOBS ?= 3
 NDS_PLATFORM ?= platform/guest.local.ini
 NDS_CLANG := $(abspath $(LLVM_BUILD))/bin/clang
 NDS_CXX := $(abspath $(LLVM_BUILD))/bin/clang++
-ND_RUNTIME_DEVICE_PATH ?= /dev/virtio-ports/nds-runtime
+ND_RUNTIME_DEVICE_PATH ?= /dev/ttyS0
 
 .PHONY: llvm-guest openmp-runtime offload-runtime nds-runtime nds-compile nds-check runtime-uart-bridge
 llvm-guest:
@@ -140,7 +140,7 @@ runtime-arm:
 	test -f $(NDS_DEVICE_FFI_ROOT)/include/ffi.h
 	mkdir -p $(BUILD)/runtime/arm
 	$(NDS_DEVICE_CC) -std=c11 -Os -s -mcpu=cortex-a7 -mfpu=vfpv4-d16 -mfloat-abi=hard \
-		-I$(NDS_DEVICE_FFI_ROOT)/include runtime/executor.c \
+		-I$(CURDIR)/include -I$(NDS_DEVICE_FFI_ROOT)/include runtime/executor.c \
 		-L$(NDS_DEVICE_FFI_ROOT)/lib -Wl,-rpath,/usr/lib -lffi -ldl \
 		-o $(BUILD)/runtime/arm/nd-executor
 
@@ -152,3 +152,15 @@ runtime-uart-start:
 runtime-guest-port:
 	python3 tests/runtime/attach_guest_port.py --qmp $(or $(NDS_QMP),/tmp/near-data-qmp.sock) \
 		--socket $(NDS_BRIDGE_SOCKET)
+
+# USB runtime path: Guest ttyS0 -> QEMU /dev/nd0 -> ND USB -> /dev/nd_rpc.
+ND_USB_TRANSPORT ?= /dev/nd0
+.PHONY: runtime-usb-check runtime-usb-bundle nds-usb-check
+runtime-usb-check: runtime
+	python3 tests/hardware/usb_runtime_smoke.py --lib $(BUILD)/runtime/libnd_runtime.so --transport $(ND_USB_TRANSPORT)
+
+runtime-usb-bundle: runtime-arm
+	cp runtime/nd-executor-service.sh $(BUILD)/runtime/arm/nd-executor-service.sh
+
+nds-usb-check: ND_RUNTIME_DEVICE_PATH=/dev/ttyS0
+nds-usb-check: nds-check

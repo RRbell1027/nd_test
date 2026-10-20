@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 struct image {uint64_t id;void *dl;};
 struct region {void *address;size_t size;uint64_t image;int owned;};
 struct symbol {uint64_t id,image;void *address;};
@@ -148,8 +149,15 @@ static int operation(uint32_t op,unsigned char *b,size_t n,unsigned char **answe
  ndr_put64(*answer,value);*size=8;return 0;
 }
 int main(int argc,char **argv) {
- int in=STDIN_FILENO,out=STDOUT_FILENO;
+ int in=STDIN_FILENO,out=STDOUT_FILENO,owned=0;
  if(argc==3&&!strcmp(argv[1],"--fd")){in=out=atoi(argv[2]);}
+ else if(argc==3&&!strcmp(argv[1],"--device")) {
+  struct stat st;
+  in=open(argv[2],O_RDWR|O_CLOEXEC);
+  if(in<0){perror("executor device");return 2;}
+  if(fstat(in,&st)||!S_ISCHR(st.st_mode)){close(in);return 2;}
+  out=in;owned=1;
+ }
  else if(argc!=1)return 2;
  int result=0;
  for(;;) {
@@ -171,5 +179,6 @@ int main(int argc,char **argv) {
  }
  for(size_t i=0;i<NDR_SLOTS;i++)if(images[i].id)unload(i);
  for(size_t i=0;i<NDR_SLOTS;i++)if(regions[i].owned)free(regions[i].address);
+ if(owned)close(in);
  return result;
 }
