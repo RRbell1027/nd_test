@@ -117,3 +117,7 @@ Guest SD 直接運算範例：`make nds-file-check NDS_JOBS=6`，見 [examples/o
 Guest compiler wrapper 與 libraries/headers 安裝見 [SDK 使用方式](sdk/README.md)。使用者保留 OpenMP/target/platform/addrsig 選項，wrapper 補上 SDK include 與 host link 設定。
 
 目前 SD Ubuntu 已整理為 `/home/dev/nds-sdk/` 獨立工具目錄（LLVM、ARM 工具鏈、wrapper、platform 與範例）；不再依賴 Guest 內的主專案 checkout。Host libraries/headers 在 `/usr/local`，USB nd_driver 留在 WSL。部署與備份細節見 [SDK 使用方式](sdk/README.md)。
+
+## Preview release packages
+
+Release assets are separated into SDK, Linux host support and Luckfox device update. See [release packaging](release/README.md).

@@ -69,6 +69,24 @@ def install():
   entry.symlink_to(wrapper)
  else:
   shutil.copy2(wrapper,entry);entry.chmod(0o755)
+ # Regenerate the bundled platform for this extraction directory.
+ platform_file=sdk/'platform/luckfox.ini'
+ if platform_file.exists():
+  toolchain=sdk/'arm-rockchip830-linux-uclibcgnueabihf'
+  triple='arm-rockchip830-linux-uclibcgnueabihf'
+  values={'toolchain-path':str(toolchain),
+   'gcc-install-path':str(toolchain/'lib/gcc'/triple/'8.3.0'),
+   'gcc-parent-lib-path':str(toolchain/'lib'),
+   'sysroot':str(toolchain/triple/'sysroot'),
+   'assembler-path':str(toolchain/'bin'/(triple+'-as')),
+   'linker-driver-path':str(toolchain/'bin'/(triple+'-g++'))}
+  saved=backup/'sdk-source-platform.ini';saved.parent.mkdir(parents=True,exist_ok=True)
+  shutil.copy2(platform_file,saved)
+  lines=[]
+  for line in platform_file.read_text().splitlines():
+   key=line.partition('=')[0]
+   lines.append(key+'='+values[key] if key in values else line)
+  platform_file.write_text('\n'.join(lines)+'\n')
  contents=json.dumps({'compiler':str(compiler),'prefix':str(prefix)},indent=2)+'\n'
  metadata.mkdir(parents=True,exist_ok=True);config.write_text(contents)
  if prefix==Path('/usr/local'):
