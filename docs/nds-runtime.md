@@ -23,7 +23,7 @@ Luckfox nd-executor → temporary ELF → dlopen/dlsym → libffi launch
 - 路徑 payload 被拒絕；missing symbol、越界 retrieve、unload 後舊 handle 均回錯誤；正常 alloc/submit/launch/retrieve/free/unload 通過。
 - NDS plugin 已以目前 LLVM headers 編譯成 Linux x86_64 ELF object；尚未完成整個 Linux libomptarget library 連結及 OpenMP 程式載入 plugin 的驗證。此證據不能視為 LEO-25 完成。
 - 實機 transport 目前是 UART binary RPC。現有 USB ND function 只有 SD READ；USB image/RPC adapter 尚未實作，不能把 UART 測試稱為 USB offload 成功。
-- 目前只接受 native little-endian ET_DYN ELF、單裝置、同步執行、單 thread/team、最多 16 個 mapped-pointer arguments。Scalar/aggregate/firstprivate ABI、parallel kernel、完整 OpenMP outlined image 仍待接通；沒有繞過 Clang 64-bit host/32-bit target 檢查。
+- 目前只接受 native little-endian ET_DYN ELF、單裝置、同步執行、單 thread/team、最多 16 個 mapped-pointer arguments。Scalar/aggregate/firstprivate ABI、parallel kernel、完整 OpenMP outlined image 仍待接通；已針對 NDS ARM32 開放 frontend 檢查，但這不代表參數 ABI 或完整 offload 通過。
 - Wire 使用固定 little-endian 欄位與 uint64 address/handle slots；裝置依自己的 uintptr_t/libffi pointer ABI 轉換。主機不傳原生指標 struct，也不以參數 storage 地址差猜大小。
 - 任一連線最多 64 image/region/symbol slots；單 frame/總 allocation 限 16 MiB。這是個人原型，不提供程式執行隔離；kernel 以 executor 權限執行。
 
