@@ -36,3 +36,12 @@
 已確認 nds-platform 所指定的 Linux as/g++ 在 Guest 可執行；先前 Windows 啟動 Linux ELF 的問題不再是 Guest 的阻塞。後續需補齊 Guest host OpenMP runtime，再接通 device shared-image 連結。原始碼檢查另顯示 linker wrapper 的 linkDevice 架構清單沒有 ARM32；完整連結目前先被缺少 -lomp 擋住，尚未實測到該階段。
 
 目前通過的 object 編譯不能當成完整參數 ABI、image 載入或板端執行已通過。
+
+## 補齊 OpenMP runtime 後重試
+
+- 同版 `llvm-project/openmp` standalone build 通過，exit 0，產出 `build/openmp/runtime/src/libomp.so`。
+- 同版 `llvm-project/offload` 以 Guest clang++ 與 NDS plugin 建置通過，exit 0，產出 `build/offload-native/libomptarget.so`。先前 clang C++ 連結模式設定錯誤已修正。
+- 完整命令加入兩個 build library 目錄的 `-L`／rpath 後，缺少 `-lomp`、`-lomptarget` 的問題解除。
+- 完整連結仍 FAIL，exit 1；此次實際錯誤為 `clang-linker-wrapper: error: arm linking is not supported`。這是 wrapper 的 ARM32 device-link 支援缺口，尚未修正。
+- 尚未產出或執行完整 OpenMP 執行檔。此輪不處理 device-only 加 -shared 的替代用法。
+- 證據：`artifacts/guest-compile/full-link-with-runtimes.log` 與 `.exit`，以及同目錄的 runtime build logs。
