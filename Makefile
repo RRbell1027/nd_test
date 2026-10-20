@@ -143,3 +143,12 @@ runtime-arm:
 		-I$(NDS_DEVICE_FFI_ROOT)/include runtime/executor.c \
 		-L$(NDS_DEVICE_FFI_ROOT)/lib -Wl,-rpath,/usr/lib -lffi -ldl \
 		-o $(BUILD)/runtime/arm/nd-executor
+
+.PHONY: runtime-uart-start runtime-guest-port
+runtime-uart-start:
+	python3 tests/runtime/start_uart_executor.py --uart $(or $(NDS_UART),/dev/ttyUSB0) \
+		--executor $(or $(NDS_EXECUTOR),$(BUILD)/runtime/arm/nd-executor)
+
+runtime-guest-port:
+	python3 tests/runtime/attach_guest_port.py --qmp $(or $(NDS_QMP),/tmp/near-data-qmp.sock) \
+		--socket $(NDS_BRIDGE_SOCKET)
