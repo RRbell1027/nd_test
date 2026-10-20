@@ -19,14 +19,14 @@ Luckfox nd-executor → temporary ELF → dlopen/dlsym → libffi launch
 ## 已驗證與範圍
 
 - Guest Ubuntu 原生 Clang/OpenMP/NDS plugin → 傳送 ARM ELF bytes → Luckfox executor → mapped buffer/kernel launch → 結果回傳，已實機通過。
-- `make nds-check NDS_JOBS=6` exit 0：`OMP_TARGET_OFFLOAD=MANDATORY` 下，delta=7、19 均通過；kernel 回傳 `sizeof(void*)*8 == 32`，不允許 host fallback。
+- `make nds-usb-check NDS_JOBS=6` exit 0：`OMP_TARGET_OFFLOAD=MANDATORY` 下，delta=7、19 均通過；kernel 回傳 `sizeof(void*)*8 == 32`，不允許 host fallback。
 - `examples/omp_runtime_smoke.cpp` 驗證 mapped int32 scalar，以及 vector<int32_t>、vector<float>、vector<double> 的 data() 連續元素。逐項與 host reference 比較；不傳 std::vector 物件。
 - `make runtime-arm` 在 Guest 交叉建置 ARM32/uClibc executor，exit 0。Native `make runtime-check` 與先前兩份不同 ARM image 的 RPC 測試也通過。
 - 修正 OpenMP 隱含 launch-environment sentinel、runtime ELF32 檢查/symbol lookup，以及 NDS device 誤用 host C++/glibc headers 的問題。最初失敗的 mandatory 測試 exit 134 已被後續成功結果取代；原 log 保留。
-- 實機 transport 是 Guest virtio serial → WSL byte bridge → Luckfox UART。USB ND interface 目前只有 SD READ；USB runtime adapter 尚未完成，不能稱為 USB offload 成功。
+- 實機 transport 是 Guest ttyS0 → QEMU pipe → WSL /dev/nd0 → USB ND interface → Luckfox /dev/nd_rpc → executor；USB offload 已通過，UART 僅用於管理。
 - 初版只涵蓋 ARM32 little-endian ET_DYN、單裝置、同步單 thread/team、最多 16 個呼叫參數（包含隱含 launch 參數）。Scalar 必須明確 mapping；一般 firstprivate/value ABI、含指標 aggregate、nested vector、parallel kernel 尚未支援。
 - Wire 使用固定 little-endian 欄位與 uint64 address/handle slots；executor 轉成原生 uintptr_t/libffi pointer ABI。主機不直接截短 host pointer。
-- 連線最多 64 image/region/symbol slots，單 frame/總 allocation 限 16 MiB；UART 大型 payload 效能尚未驗證。Kernel 以 executor 權限執行。
+- 連線最多 64 image/region/symbol slots，單 frame/總 allocation 限 16 MiB；大型 payload 吞吐效能尚未量測。Kernel 以 executor 權限執行。
 
 ## 建置與本機測試
 
@@ -51,7 +51,7 @@ TC=/sdk/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgn
 BR=/sdk/luckfox-pico/sysdrv/source/buildroot/buildroot-2023.02.6/output/host/arm-buildroot-linux-uclibcgnueabihf/sysroot
 mkdir -p build/runtime/arm
 $TC -std=c11 -Os -s -mcpu=cortex-a7 -mfpu=vfpv4-d16 -mfloat-abi=hard \
-  -I$BR/usr/include runtime/executor.c -L$BR/usr/lib -Wl,-rpath,/usr/lib \
+  -Iinclude -I$BR/usr/include runtime/executor.c -L$BR/usr/lib -Wl,-rpath,/usr/lib \
   -lffi -ldl -o build/runtime/arm/nd-executor
 $TC -shared -fPIC -Os -s -mcpu=cortex-a7 -mfpu=vfpv4-d16 -mfloat-abi=hard \
   examples/runtime_kernel.c -o build/runtime/arm/kernel-a.so
@@ -81,7 +81,7 @@ NDS_RUNTIME_INCLUDE_DIR=<near_data>/include
 NDS_RUNTIME_LIBRARY=<near_data>/build/runtime/libnd_runtime.a
 ```
 
-執行時 `ND_RUNTIME_DEVICE_PATH` 必須指向已啟動 executor 的專用通道，例如目前的 `/dev/ttyUSB0`。它不是原有 SD-read `/dev/nd0` 協定，不能直接互換。USB adapter 完成前不設定為 `/dev/nd0`。
+執行時 `ND_RUNTIME_DEVICE_PATH` 指向 runtime 通道：Guest 預設 `/dev/ttyS0`，由 QEMU pipe chardev 連接 WSL `/dev/nd0`。新版 host driver 將 runtime frame 分裝成 USB RPC commands，與原有 SD READ 共用 ND interface；同一時間只使用一個 client。
 
 Windows 開發環境可用 `tests/runtime/compile_plugin.py` 搭配既有 LLVM build、WSL Linux sysroot 與 `/sdk/nds-llvm-headers` 做 compile-only 檢查。檢查使用真實 TableGen JSON enum records；一般完整 offload build 仍由 offload-tblgen 產生 headers。
 
@@ -103,7 +103,23 @@ Windows 開發環境可用 `tests/runtime/compile_plugin.py` 搭配既有 LLVM b
 - 跨裝置資料避免 long、unsigned long、size_t、ptrdiff_t、long double；含指標 struct、巢狀 vector 與深層 mapping 暫不支援。這些是使用規範，不新增 frontend 型別拒絕。
 - frontend 針對 NDS vendor 的已知架構開放 target 與不同指標寬度；未知架構及非 NDS target 保留原有檢查。開放檢查不代表參數 ABI 或完整 offload 已驗證。
 
-## Guest 與 Luckfox 執行入口
+## USB runtime 執行入口
+
+正式測試路徑為 Guest `/dev/ttyS0` → QEMU `-chardev pipe,id=nd,path=/dev/nd0 -serial chardev:nd` → WSL `nd_driver.ko` → USB bulk → Luckfox `f_nd` → `/dev/nd_rpc` → executor。UART 留作登入與部署。Guest 管理 console 使用第二個 serial port ttyS1。
+
+板端將 `make runtime-usb-bundle` 產生的 ARM executor 安裝到 `/root/nd-runtime/nd-executor`，service 安裝到 `/etc/init.d/S99nd-runtime` 並設為可執行。service 使用 `--device /dev/nd_rpc`；HELLO/reset 或斷線會使舊 executor 結束，由 supervisor 重啟。kernel 必須包含新版 f_nd，WSL 亦需新版 nd_driver。
+
+```sh
+# WSL：QEMU 尚未使用 /dev/nd0 時
+make runtime-usb-check
+# Guest：賦予使用者 ttyS0 存取權後
+make runtime-usb-check ND_USB_TRANSPORT=/dev/ttyS0
+make nds-usb-check NDS_JOBS=6
+```
+
+USB adapter 保留 16-byte READ 協定。runtime RPC body 上限 16 MiB，以最多 4096 bytes 的 ND payload 分段，RPC_OUT 使用固定 4112-byte USB transfer。
+
+## 舊 UART 測試入口（歷史 bring-up）
 
 Guest SDK/ARM libffi 路徑見 Makefile 的 `NDS_DEVICE_CC`、`NDS_DEVICE_FFI_ROOT`，可覆寫。`platform/guest.local.ini` 指向 Guest SDK；FFI 必須使用 ARM 版，不能使用 x86_64 headers/library。
 
@@ -112,7 +128,7 @@ Guest SDK/ARM libffi 路徑見 Makefile 的 `NDS_DEVICE_CC`、`NDS_DEVICE_FFI_RO
 make nds-runtime NDS_JOBS=6
 make runtime-arm
 # 通道已由管理端啟動，且 dev 可存取此 virtio port 時：
-make nds-check NDS_JOBS=6
+make nds-check NDS_JOBS=6 ND_RUNTIME_DEVICE_PATH=/dev/virtio-ports/nds-runtime
 ```
 
 管理端（目前為 WSL）準備好可用的 ARM executor 檔案後，以下各步使用同一個 `NDS_BRIDGE_SOCKET`：
@@ -126,6 +142,12 @@ make runtime-guest-port NDS_QMP=/tmp/near-data-qmp.sock
 
 Guest port 為 `/dev/virtio-ports/nds-runtime`；首次需由管理端賦予 dev 存取權。UART 只能有一個使用者，不可同時開 shell terminal 與 bridge。只上傳通用 executor；kernel image 每次由編譯後的執行檔交給 plugin 傳送。
 
-目前保留 executor/bridge/Guest port 運行，可直接重跑 Guest `make nds-check`。停止時應先用 runtime SHUTDOWN RPC 結束 executor，待 tty 還原後停止 bridge；重新開機或重設 UART 後需重新建立通道。
+舊 UART 路徑不會隨 USB 測試自動啟動。停止時應先用 runtime SHUTDOWN RPC 結束 executor，待 tty 還原後停止 bridge；重新開機或重設 UART 後需重新建立通道。
 
 本輪證據保存在 Guest `artifacts/guest-link/make-nds-check.log`、`.exit` 及 `runtime-board2.log`；本機亦保存對應 log。
+
+## USB 真機驗證（2026-10-20）
+
+Guest `make nds-usb-check NDS_JOBS=6` 退出碼 0；MANDATORY offload 的 delta=7/19 皆 PASS，kernel 回報指標 32 bits，int32/float/double vector 元素逐項符合 host reference。Guest `make runtime-usb-check ND_USB_TRANSPORT=/dev/ttyS0` 退出碼 0，1/4/496/512/4096/8193 bytes 回傳及越界錯誤回報皆 PASS。WSL 直連 USB 測試與三組 legacy READ 比對亦 PASS。
+
+新版 kernel 為 5.10.160 #6；boot 寫入後讀回逐位元組相符。測試紀錄保存在 `artifacts/usb-runtime/guest-make.log`、`guest-make.rc`、`guest-smoke.log`、`guest-smoke.rc`（本機與 Guest）。QEMU 未啟動 UART runtime bridge。此結果涵蓋目前支援的 mapped buffers，不代表深層 mapping 或全部 OpenMP 語意已實作。
