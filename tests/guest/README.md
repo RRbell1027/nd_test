@@ -75,3 +75,18 @@ For application linking, add `-L` and rpath for both
 successfully built both runtimes, but full offload linking still failed with
 `arm linking is not supported` in clang-linker-wrapper. It did not produce a
 working OpenMP offload executable.
+
+## Complete executable validation
+
+After the NDS wrapper integration, use the real full-link test instead of
+requiring device-only -shared support:
+
+```sh
+python3 tests/guest/validate_link.py \
+  --clang build/llvm/bin/clang --platform platform/guest.local.ini \
+  --libomp-dir build/openmp/runtime/src --libomptarget-dir build/offload-native
+```
+
+This passed in the Guest on 2026-10-20. It checks the host executable, the
+ARM32 ET_DYN image and its embedded bytes, then executes explicitly disabled
+offloading (host fallback). It does not claim Luckfox execution.

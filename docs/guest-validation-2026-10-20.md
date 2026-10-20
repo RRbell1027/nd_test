@@ -45,3 +45,13 @@
 - 完整連結仍 FAIL，exit 1；此次實際錯誤為 `clang-linker-wrapper: error: arm linking is not supported`。這是 wrapper 的 ARM32 device-link 支援缺口，尚未修正。
 - 尚未產出或執行完整 OpenMP 執行檔。此輪不處理 device-only 加 -shared 的替代用法。
 - 證據：`artifacts/guest-compile/full-link-with-runtimes.log` 與 `.exit`，以及同目錄的 runtime build logs。
+
+## NDS linker wrapper 接通後
+
+- LLVM commit `1dbd14f88`：wrapper 依 NDS vendor 進入 device linking、傳遞 nds-platform；普通 clang --target=NDS 呼叫也選擇 NDSToolChain。NDS image 的 libraries 來自平台設定，不混入 host libomp/libomptarget。
+- Guest Clang 與 linker wrapper 增量重建 PASS，exit 0。
+- 原本的最小 omp target 程式完整編譯／連結 PASS，exit 0。verbose log 確認實際呼叫 Guest SDK g++，經 NDS linker 產生 shared image。
+- `tests/guest/validate_link.py` 在 Guest 實測 PASS，exit 0：host 為 x86_64 executable；保留的 device image 為 ARM32 ELF ET_DYN；完整 image bytes 確實嵌入 host executable。
+- `OMP_TARGET_OFFLOAD=DISABLED` 的 host fallback 執行 PASS，exit 0。這不是 Luckfox offload 執行。
+- Guest 證據：`artifacts/guest-link/manifest.json`、`link.log`、`host-fallback.log` 與保留的 ARM image；本機保存 manifest 與 log 摘錄。
+- 此結果只涵蓋最小 mapped int 的編譯／連結，不代表 scalar/vector 等跨位寬參數 ABI 或實機 kernel launch 已驗證。
