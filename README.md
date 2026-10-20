@@ -115,3 +115,5 @@ Use `make nds-usb-check`; UART remains available for board management. See
 Guest SD 直接運算範例：`make nds-file-check NDS_JOBS=6`，見 [examples/omp_file_read.cpp](examples/omp_file_read.cpp)。公開 libnd 與 OpenMP plugin 共用 `libnd_runtime.so` session。Guest 已改為直接使用實體 SD，新增檔案同步後也可供 Luckfox 讀取；啟動方式見 [直接 SD 模式](docs/guest-direct-sd.md)。
 
 Guest compiler wrapper 與 libraries/headers 安裝見 [SDK 使用方式](sdk/README.md)。使用者保留 OpenMP/target/platform/addrsig 選項，wrapper 補上 SDK include 與 host link 設定。
+
+目前 SD Ubuntu 已整理為 `/home/dev/nds-sdk/` 獨立工具目錄（LLVM、ARM 工具鏈、wrapper、platform 與範例）；不再依賴 Guest 內的主專案 checkout。Host libraries/headers 在 `/usr/local`，USB nd_driver 留在 WSL。部署與備份細節見 [SDK 使用方式](sdk/README.md)。
